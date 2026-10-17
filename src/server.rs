@@ -79,7 +79,7 @@ async fn messages_handler(
     headers: axum::http::HeaderMap,
     Json(req): Json<MessagesRequest>,
 ) -> Response {
-    let session_key = crate::engine::session::extract_session_key(&req);
+    let session_key = crate::engine::session::extract_session_key_from_headers_or_req(&headers, &req);
     eprintln!("=== INCOMING CLAUDE CODE HEADERS ===");
     for (name, val) in &headers {
         eprintln!("  HEADER: {} = {:?}", name, val);
@@ -159,7 +159,11 @@ async fn messages_handler(
                                         }
                                         let events = translator.feed_chunk(data);
                                         for ev in events {
-                                            let _ = tx.send(Ok(Event::default().data(ev))).await;
+                                            let _ = tx
+                                                .send(Ok(Event::default()
+                                                    .event(ev.event)
+                                                    .data(ev.data.to_string())))
+                                                .await;
                                         }
                                     }
                                 }
@@ -246,6 +250,7 @@ async fn messages_handler(
             let agent_clone = agent.clone();
             let model_clone = target.model.clone();
             let req_model = req.model.clone();
+            let tools_decl = req.tools.clone().unwrap_or_default();
             let session_mgr = state.session_mgr.clone();
             let s_key = session_key.clone();
 
@@ -275,36 +280,106 @@ async fn messages_handler(
                         "usage": {"input_tokens": 50, "output_tokens": 1}
                     }
                 });
-                let _ = sse_tx.send(Ok(Event::default().data(start_ev.to_string()))).await;
+                let _ = sse_tx
+                    .send(Ok(Event::default()
+                        .event("message_start")
+                        .data(start_ev.to_string())))
+                    .await;
 
                 let blk_start = json!({
                     "type": "content_block_start",
                     "index": 0,
                     "content_block": {"type": "text", "text": ""}
                 });
-                let _ = sse_tx.send(Ok(Event::default().data(blk_start.to_string()))).await;
+                let _ = sse_tx
+                    .send(Ok(Event::default()
+                        .event("content_block_start")
+                        .data(blk_start.to_string())))
+                    .await;
 
+                let mut accumulated = String::new();
                 while let Some(chunk) = prompt_rx.recv().await {
+                    accumulated.push_str(&chunk);
                     let delta = json!({
                         "type": "content_block_delta",
                         "index": 0,
                         "delta": {"type": "text_delta", "text": chunk}
                     });
-                    let _ = sse_tx.send(Ok(Event::default().data(delta.to_string()))).await;
+                    let _ = sse_tx
+                        .send(Ok(Event::default()
+                            .event("content_block_delta")
+                            .data(delta.to_string())))
+                        .await;
                 }
 
                 let blk_stop = json!({"type": "content_block_stop", "index": 0});
-                let _ = sse_tx.send(Ok(Event::default().data(blk_stop.to_string()))).await;
+                let _ = sse_tx
+                    .send(Ok(Event::default()
+                        .event("content_block_stop")
+                        .data(blk_stop.to_string())))
+                    .await;
+
+                let mut casing_map = std::collections::HashMap::new();
+                for t in &tools_decl {
+                    casing_map.insert(t.name.to_ascii_lowercase(), t.name.clone());
+                }
+                let repaired = crate::protocol::repair::ToolCallRepairEngine::detect_and_extract(
+                    &accumulated,
+                    &casing_map,
+                );
+
+                let mut stop_reason = "end_turn";
+                let mut blk_idx = 0;
+                if !repaired.is_empty() {
+                    for (i, rep) in repaired.into_iter().enumerate() {
+                        blk_idx += 1;
+                        let tc_start = json!({
+                            "type": "content_block_start",
+                            "index": blk_idx,
+                            "content_block": {"type": "tool_use", "id": format!("call_acp_rep_{}", i), "name": rep.name, "input": {}}
+                        });
+                        let _ = sse_tx
+                            .send(Ok(Event::default()
+                                .event("content_block_start")
+                                .data(tc_start.to_string())))
+                            .await;
+                        let tc_delta = json!({
+                            "type": "content_block_delta",
+                            "index": blk_idx,
+                            "delta": {"type": "input_json_delta", "partial_json": rep.arguments.to_string()}
+                        });
+                        let _ = sse_tx
+                            .send(Ok(Event::default()
+                                .event("content_block_delta")
+                                .data(tc_delta.to_string())))
+                            .await;
+                        let tc_stop = json!({"type": "content_block_stop", "index": blk_idx});
+                        let _ = sse_tx
+                            .send(Ok(Event::default()
+                                .event("content_block_stop")
+                                .data(tc_stop.to_string())))
+                            .await;
+                    }
+                    stop_reason = "tool_use";
+                }
 
                 let msg_delta = json!({
                     "type": "message_delta",
-                    "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": null},
                     "usage": {"output_tokens": 20}
                 });
-                let _ = sse_tx.send(Ok(Event::default().data(msg_delta.to_string()))).await;
+                let _ = sse_tx
+                    .send(Ok(Event::default()
+                        .event("message_delta")
+                        .data(msg_delta.to_string())))
+                    .await;
 
                 let msg_stop = json!({"type": "message_stop"});
-                let _ = sse_tx.send(Ok(Event::default().data(msg_stop.to_string()))).await;
+                let _ = sse_tx
+                    .send(Ok(Event::default()
+                        .event("message_stop")
+                        .data(msg_stop.to_string())))
+                    .await;
             });
 
             return Sse::new(ReceiverStream::new(sse_rx))

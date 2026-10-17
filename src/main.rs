@@ -30,13 +30,13 @@ async fn main() -> anyhow::Result<()> {
         }) => {
             launch_claude(&model, port, &extra_args)?;
         }
-        Some(Commands::List { free_only }) => {
+        Some(Commands::List { free_only } | Commands::Models { free_only }) => {
             let registry =
                 CatalogRegistry::load_from_system().unwrap_or_else(|_| CatalogRegistry::new());
             let mut list = if free_only {
                 registry.filter_free_models()
             } else {
-                registry.filter_free_models() // default to available free models
+                registry.all_models()
             };
             list.sort_by(|a, b| a.id.cmp(&b.id));
 

@@ -5,7 +5,8 @@ use clap::{Parser, Subcommand};
     name = "l2c",
     author = "light",
     version = "0.1.0",
-    about = "Universal high-performance bridge connecting Claude Code CLI to Local Agents & OpenCode Free Tier"
+    about = "Universal high-performance bridge connecting Claude Code CLI to Local Agents & OpenCode Free Tier",
+    subcommand_precedence_over_arg = true
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -27,6 +28,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug, Clone)]
 pub enum Commands {
     /// Start the proxy server daemon
+    #[command(alias = "daemon")]
     Serve {
         #[arg(short, long, default_value = "4001")]
         port: u16,
@@ -47,6 +49,12 @@ pub enum Commands {
         #[arg(short, long)]
         free_only: bool,
     },
+    /// List available models and aliases
+    Models {
+        #[arg(short, long)]
+        free_only: bool,
+    },
     /// Healthcheck Docker WARP nodes and local agents
+    #[command(alias = "diagnose", alias = "check")]
     Doctor,
 }

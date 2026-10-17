@@ -1,6 +1,25 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseEvent {
+    pub event: String,
+    pub data: Value,
+}
+
+impl SseEvent {
+    pub fn new(event: impl Into<String>, data: Value) -> Self {
+        Self {
+            event: event.into(),
+            data,
+        }
+    }
+
+    pub fn to_wire_string(&self) -> String {
+        format!("event: {}\ndata: {}\n\n", self.event, self.data)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum BlockState {
     None,
@@ -17,6 +36,8 @@ pub struct SseStreamTranslator {
     block_index: usize,
     finished: bool,
     casing_map: HashMap<String, String>,
+    has_native_tool_calls: bool,
+    accumulated_text: String,
 }
 
 impl SseStreamTranslator {
@@ -29,6 +50,8 @@ impl SseStreamTranslator {
             block_index: 0,
             finished: false,
             casing_map: HashMap::new(),
+            has_native_tool_calls: false,
+            accumulated_text: String::new(),
         }
     }
 
@@ -37,7 +60,7 @@ impl SseStreamTranslator {
             .insert(declared_name.to_ascii_lowercase(), declared_name.to_string());
     }
 
-    pub fn feed_chunk(&mut self, chunk_str: &str) -> Vec<String> {
+    pub fn feed_chunk(&mut self, chunk_str: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
         let parsed: Value = match serde_json::from_str(chunk_str) {
             Ok(v) => v,
@@ -46,7 +69,7 @@ impl SseStreamTranslator {
 
         if !self.started {
             self.started = true;
-            events.push(self.format_event(
+            events.push(self.create_event(
                 "message_start",
                 json!({
                     "type": "message_start",
@@ -78,14 +101,14 @@ impl SseStreamTranslator {
                 if !reasoning.is_empty() {
                     if self.state != BlockState::Thinking {
                         if self.state != BlockState::None {
-                            events.push(self.format_event(
+                            events.push(self.create_event(
                                 "content_block_stop",
                                 json!({"type": "content_block_stop", "index": self.block_index}),
                             ));
                             self.block_index += 1;
                         }
                         self.state = BlockState::Thinking;
-                        events.push(self.format_event(
+                        events.push(self.create_event(
                             "content_block_start",
                             json!({
                                 "type": "content_block_start",
@@ -94,7 +117,7 @@ impl SseStreamTranslator {
                             }),
                         ));
                     }
-                    events.push(self.format_event(
+                    events.push(self.create_event(
                         "content_block_delta",
                         json!({
                             "type": "content_block_delta",
@@ -108,16 +131,17 @@ impl SseStreamTranslator {
             // 2. Normal text
             if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
                 if !text.is_empty() {
+                    self.accumulated_text.push_str(text);
                     if self.state != BlockState::Text {
                         if self.state != BlockState::None {
-                            events.push(self.format_event(
+                            events.push(self.create_event(
                                 "content_block_stop",
                                 json!({"type": "content_block_stop", "index": self.block_index}),
                             ));
                             self.block_index += 1;
                         }
                         self.state = BlockState::Text;
-                        events.push(self.format_event(
+                        events.push(self.create_event(
                             "content_block_start",
                             json!({
                                 "type": "content_block_start",
@@ -126,7 +150,7 @@ impl SseStreamTranslator {
                             }),
                         ));
                     }
-                    events.push(self.format_event(
+                    events.push(self.create_event(
                         "content_block_delta",
                         json!({
                             "type": "content_block_delta",
@@ -137,9 +161,10 @@ impl SseStreamTranslator {
                 }
             }
 
-            // 3. Tool Calls
+            // 3. Native Tool Calls
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                 for tc in tool_calls {
+                    self.has_native_tool_calls = true;
                     if let Some(func) = tc.get("function") {
                         let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("call_gen");
                         let raw_name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -152,14 +177,14 @@ impl SseStreamTranslator {
 
                         if self.state != BlockState::ToolUse {
                             if self.state != BlockState::None {
-                                events.push(self.format_event(
+                                events.push(self.create_event(
                                     "content_block_stop",
                                     json!({"type": "content_block_stop", "index": self.block_index}),
                                 ));
                                 self.block_index += 1;
                             }
                             self.state = BlockState::ToolUse;
-                            events.push(self.format_event(
+                            events.push(self.create_event(
                                 "content_block_start",
                                 json!({
                                     "type": "content_block_start",
@@ -169,7 +194,7 @@ impl SseStreamTranslator {
                             ));
                         }
                         if !args.is_empty() {
-                            events.push(self.format_event(
+                            events.push(self.create_event(
                                 "content_block_delta",
                                 json!({
                                     "type": "content_block_delta",
@@ -187,16 +212,60 @@ impl SseStreamTranslator {
             if !self.finished {
                 self.finished = true;
                 if self.state != BlockState::None {
-                    events.push(self.format_event(
+                    events.push(self.create_event(
                         "content_block_stop",
                         json!({"type": "content_block_stop", "index": self.block_index}),
                     ));
                 }
-                let stop_reason = match reason {
+
+                let mut stop_reason = match reason {
                     "tool_calls" => "tool_use",
                     _ => "end_turn",
                 };
-                events.push(self.format_event(
+
+                // Repair hallucinated tool calls if no native tool calls were present
+                if !self.has_native_tool_calls {
+                    let repaired = crate::protocol::repair::ToolCallRepairEngine::detect_and_extract(
+                        &self.accumulated_text,
+                        &self.casing_map,
+                    );
+                    if !repaired.is_empty() {
+                        for (idx, rep) in repaired.into_iter().enumerate() {
+                            self.block_index += 1;
+                            events.push(self.create_event(
+                                "content_block_start",
+                                json!({
+                                    "type": "content_block_start",
+                                    "index": self.block_index,
+                                    "content_block": {
+                                        "type": "tool_use",
+                                        "id": format!("call_rep_{}", idx),
+                                        "name": rep.name,
+                                        "input": {}
+                                    }
+                                }),
+                            ));
+                            events.push(self.create_event(
+                                "content_block_delta",
+                                json!({
+                                    "type": "content_block_delta",
+                                    "index": self.block_index,
+                                    "delta": {
+                                        "type": "input_json_delta",
+                                        "partial_json": rep.arguments.to_string()
+                                    }
+                                }),
+                            ));
+                            events.push(self.create_event(
+                                "content_block_stop",
+                                json!({"type": "content_block_stop", "index": self.block_index}),
+                            ));
+                        }
+                        stop_reason = "tool_use";
+                    }
+                }
+
+                events.push(self.create_event(
                     "message_delta",
                     json!({
                         "type": "message_delta",
@@ -204,14 +273,14 @@ impl SseStreamTranslator {
                         "usage": {"output_tokens": 80}
                     }),
                 ));
-                events.push(self.format_event("message_stop", json!({"type": "message_stop"})));
+                events.push(self.create_event("message_stop", json!({"type": "message_stop"})));
             }
         }
 
         events
     }
 
-    fn format_event(&self, event_name: &str, data: Value) -> String {
-        format!("event: {}\ndata: {}\n\n", event_name, data.to_string())
+    fn create_event(&self, event_name: &str, data: Value) -> SseEvent {
+        SseEvent::new(event_name, data)
     }
 }

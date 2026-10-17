@@ -58,7 +58,7 @@ impl WarpPool {
         let cooldowns = self.cooldowns.lock().unwrap();
         self.proxies
             .iter()
-            .all(|p| cooldowns.get(p).map_or(false, |exp| *exp > now))
+            .all(|p| cooldowns.get(p).is_some_and(|exp| *exp > now))
     }
 
     fn trigger_auto_heal(&self) {

@@ -21,10 +21,10 @@ impl Default for AgentRegistry {
             agents: HashMap::new(),
             order: Vec::new(),
         };
-        reg.register(Arc::new(CommandCodeAgent::default()));
+        reg.register(Arc::new(CommandCodeAgent));
         reg.register(Arc::new(OpenCodeAgent::default()));
         reg.register(Arc::new(KiloAgent::default()));
-        reg.register(Arc::new(ClineAgent::default()));
+        reg.register(Arc::new(ClineAgent));
         reg
     }
 }

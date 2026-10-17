@@ -15,11 +15,21 @@ pub struct CatalogRegistry {
     models: HashMap<String, ModelMetadata>,
 }
 
+impl Default for CatalogRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CatalogRegistry {
     pub fn new() -> Self {
         Self {
             models: HashMap::new(),
         }
+    }
+
+    pub fn all_models(&self) -> Vec<ModelMetadata> {
+        self.models.values().cloned().collect()
     }
 
     pub fn load_from_system() -> anyhow::Result<Self> {
