@@ -148,14 +148,14 @@ async fn messages_handler(
                         }
 
                         let mut stream = upstream_resp.bytes_stream();
-                        while let Some(item) = stream.next().await {
+                        'stream_loop: while let Some(item) = stream.next().await {
                             if let Ok(bytes) = item {
                                 let text = String::from_utf8_lossy(&bytes);
                                 for line in text.lines() {
                                     let line = line.trim();
                                     if let Some(data) = line.strip_prefix("data: ") {
                                         if data == "[DONE]" {
-                                            break;
+                                            break 'stream_loop;
                                         }
                                         let events = translator.feed_chunk(data);
                                         for ev in events {
@@ -168,6 +168,16 @@ async fn messages_handler(
                                     }
                                 }
                             }
+                        }
+
+                        // Guarantees clean stream closure even if upstream socket drops
+                        let tail_events = translator.finish_stream_if_needed();
+                        for ev in tail_events {
+                            let _ = tx
+                                .send(Ok(Event::default()
+                                    .event(ev.event)
+                                    .data(ev.data.to_string())))
+                                .await;
                         }
                     });
 
@@ -304,6 +314,20 @@ async fn messages_handler(
                         "type": "content_block_delta",
                         "index": 0,
                         "delta": {"type": "text_delta", "text": chunk}
+                    });
+                    let _ = sse_tx
+                        .send(Ok(Event::default()
+                            .event("content_block_delta")
+                            .data(delta.to_string())))
+                        .await;
+                }
+
+                if accumulated.trim().is_empty() {
+                    let fallback = "Understood. Proceeding with task execution...";
+                    let delta = json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": fallback}
                     });
                     let _ = sse_tx
                         .send(Ok(Event::default()

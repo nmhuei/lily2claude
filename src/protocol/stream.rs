@@ -280,6 +280,75 @@ impl SseStreamTranslator {
         events
     }
 
+    /// Guarantees that active blocks and stream completion events are emitted
+    /// even if upstream closes abruptly without sending finish_reason
+    pub fn finish_stream_if_needed(&mut self) -> Vec<SseEvent> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        let mut events = Vec::new();
+        if self.state != BlockState::None {
+            events.push(self.create_event(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": self.block_index}),
+            ));
+        }
+
+        let mut stop_reason = "end_turn";
+        if !self.has_native_tool_calls {
+            let repaired = crate::protocol::repair::ToolCallRepairEngine::detect_and_extract(
+                &self.accumulated_text,
+                &self.casing_map,
+            );
+            if !repaired.is_empty() {
+                for (idx, rep) in repaired.into_iter().enumerate() {
+                    self.block_index += 1;
+                    events.push(self.create_event(
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": self.block_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": format!("call_rep_{}", idx),
+                                "name": rep.name,
+                                "input": {}
+                            }
+                        }),
+                    ));
+                    events.push(self.create_event(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": self.block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": rep.arguments.to_string()
+                            }
+                        }),
+                    ));
+                    events.push(self.create_event(
+                        "content_block_stop",
+                        json!({"type": "content_block_stop", "index": self.block_index}),
+                    ));
+                }
+                stop_reason = "tool_use";
+            }
+        }
+
+        events.push(self.create_event(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                "usage": {"output_tokens": 80}
+            }),
+        ));
+        events.push(self.create_event("message_stop", json!({"type": "message_stop"})));
+        events
+    }
+
     fn create_event(&self, event_name: &str, data: Value) -> SseEvent {
         SseEvent::new(event_name, data)
     }

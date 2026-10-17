@@ -211,28 +211,50 @@ impl SessionManager {
         provider: &str,
         command: &[String],
     ) -> anyhow::Result<Arc<Mutex<AcpSession>>> {
-        let full_key = format!("{}:{}", provider, session_key);
+        let base_key = format!("{}:{}", provider, session_key);
         let mut lock = self.sessions.lock().await;
 
-        if let Some(existing) = lock.get(&full_key) {
-            // Check if process is still alive
-            let mut session_lock = existing.lock().await;
-            match session_lock.child.try_wait() {
-                Ok(None) => {
-                    // Still running! Reuse existing session!
-                    drop(session_lock);
-                    return Ok(existing.clone());
-                }
-                _ => {
-                    // Exited, drop and recreate
+        // Try existing worker slots (base, worker_1, worker_2, worker_3) to enable parallel subagents
+        for worker_idx in 0..4 {
+            let full_key = if worker_idx == 0 {
+                base_key.clone()
+            } else {
+                format!("{}:worker_{}", base_key, worker_idx)
+            };
+
+            if let Some(existing) = lock.get(&full_key) {
+                if let Ok(mut session_lock) = existing.try_lock() {
+                    match session_lock.child.try_wait() {
+                        Ok(None) => {
+                            // Still running and not currently busy!
+                            drop(session_lock);
+                            return Ok(existing.clone());
+                        }
+                        _ => {
+                            // Exited process, will spawn new one below
+                        }
+                    }
+                } else {
+                    // Session is busy executing another concurrent subagent turn! Try next worker slot!
+                    continue;
                 }
             }
+
+            // Spawn fresh session for this slot
+            let new_session = AcpSession::spawn(command).await?;
+            let handle = Arc::new(Mutex::new(new_session));
+            lock.insert(full_key, handle.clone());
+            return Ok(handle);
         }
 
-        // Spawn new session
+        // If all 4 workers are busy, return base handle and await lock
+        if let Some(existing) = lock.get(&base_key) {
+            return Ok(existing.clone());
+        }
+
         let new_session = AcpSession::spawn(command).await?;
         let handle = Arc::new(Mutex::new(new_session));
-        lock.insert(full_key, handle.clone());
+        lock.insert(base_key, handle.clone());
         Ok(handle)
     }
 
