@@ -59,28 +59,99 @@ impl EngineRouter {
         }
     }
 
+    fn parse_targets(targets: &[String]) -> Vec<TargetCandidate> {
+        targets
+            .iter()
+            .filter_map(|t| {
+                let parts: Vec<&str> = t.splitn(2, ':').collect();
+                if parts.len() == 2 {
+                    Some(TargetCandidate {
+                        provider: parts[0].to_string(),
+                        model: parts[1].to_string(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub fn resolve_alias(&self, alias: &str) -> Vec<TargetCandidate> {
+        let clean = alias.trim().to_lowercase();
+
+        // 1. Direct alias match
         if let Some(targets) = self.config.aliases.get(alias) {
-            targets
-                .iter()
-                .filter_map(|t| {
-                    let parts: Vec<&str> = t.splitn(2, ':').collect();
-                    if parts.len() == 2 {
-                        Some(TargetCandidate {
-                            provider: parts[0].to_string(),
-                            model: parts[1].to_string(),
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else {
-            vec![TargetCandidate {
-                provider: "opencode".to_string(),
-                model: alias.to_string(),
-            }]
+            return Self::parse_targets(targets);
         }
+        if let Some(targets) = self.config.aliases.get(&clean) {
+            return Self::parse_targets(targets);
+        }
+
+        // 2. Claude / Anthropic subagent model names -> transparently map to DeepSeek V4.1 Flash
+        if clean.contains("claude")
+            || clean.contains("haiku")
+            || clean.contains("sonnet")
+            || clean.contains("opus")
+            || clean.contains("anthropic")
+            || clean == "default"
+            || clean.is_empty()
+        {
+            if let Some(targets) = self.config.aliases.get("deepseek") {
+                return Self::parse_targets(targets);
+            }
+        }
+
+        // 3. Family fuzzy matching
+        if clean.contains("deepseek") {
+            if let Some(targets) = self.config.aliases.get("deepseek") {
+                return Self::parse_targets(targets);
+            }
+        }
+        if clean.contains("glm") {
+            if let Some(targets) = self.config.aliases.get("glm") {
+                return Self::parse_targets(targets);
+            }
+        }
+        if clean.contains("nemotron") {
+            if let Some(targets) = self.config.aliases.get("nemotron") {
+                return Self::parse_targets(targets);
+            }
+        }
+        if clean.contains("mimo") {
+            if let Some(targets) = self.config.aliases.get("mimo") {
+                return Self::parse_targets(targets);
+            }
+        }
+        if clean.contains("kilo") {
+            if let Some(targets) = self.config.aliases.get("kilo") {
+                return Self::parse_targets(targets);
+            }
+        }
+
+        // 4. Provider:model explicit specification
+        if alias.contains(':') {
+            let parts: Vec<&str> = alias.splitn(2, ':').collect();
+            if parts.len() == 2 {
+                let mut res = vec![TargetCandidate {
+                    provider: parts[0].to_string(),
+                    model: parts[1].to_string(),
+                }];
+                if let Some(ds) = self.config.aliases.get("deepseek") {
+                    res.extend(Self::parse_targets(ds));
+                }
+                return res;
+            }
+        }
+
+        // 5. Safe fallback: attempt opencode model, with guaranteed DeepSeek fallback candidates
+        let mut candidates = vec![TargetCandidate {
+            provider: "opencode".to_string(),
+            model: alias.to_string(),
+        }];
+        if let Some(ds) = self.config.aliases.get("deepseek") {
+            candidates.extend(Self::parse_targets(ds));
+        }
+        candidates
     }
 
     pub fn get_http_adapter(&self, provider: &str) -> Option<Arc<HttpUpstreamAdapter>> {

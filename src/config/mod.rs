@@ -27,12 +27,32 @@ impl Config {
         let agent_reg = crate::agents::AgentRegistry::default();
         let mut aliases = agent_reg.default_aliases();
 
-        // Ensure transparent aliases have full fallbacks
-        aliases.entry("deepseek".to_string()).or_insert_with(|| vec![
+        let deepseek_targets = vec![
             "commandcode:deepseek/deepseek-v4.1-flash".to_string(),
             "opencode:deepseek-v4.1-flash-free".to_string(),
             "kilo:kilo-auto/free".to_string(),
-        ]);
+        ];
+
+        // Ensure transparent aliases have full fallbacks
+        aliases.entry("deepseek".to_string()).or_insert_with(|| deepseek_targets.clone());
+        aliases.entry("deepseek-v4.1-flash".to_string()).or_insert_with(|| deepseek_targets.clone());
+        aliases.entry("deepseek/deepseek-v4.1-flash".to_string()).or_insert_with(|| deepseek_targets.clone());
+
+        // Map Anthropic subagent models transparently to DeepSeek V4.1 Flash
+        for anthropic_model in &[
+            "claude-3-5-haiku-20241022",
+            "claude-3-haiku-20240307",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-7-sonnet-20250219",
+            "claude-3-opus-20240229",
+            "haiku",
+            "sonnet",
+            "opus",
+            "default",
+        ] {
+            aliases.entry(anthropic_model.to_string()).or_insert_with(|| deepseek_targets.clone());
+        }
+
         aliases.entry("glm".to_string()).or_insert_with(|| vec![
             "commandcode:z-ai/glm-5.3-flash".to_string(),
             "opencode:glm-5.3-flash-free".to_string(),

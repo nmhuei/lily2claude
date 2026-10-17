@@ -146,6 +146,20 @@ impl CatalogRegistry {
                 is_free: true,
             });
         }
+        if model.contains("claude")
+            || model.contains("haiku")
+            || model.contains("sonnet")
+            || model.contains("opus")
+            || model == "default"
+        {
+            return Some(ModelMetadata {
+                id: model.to_string(),
+                name: "DeepSeek V4.1 Flash (Subagent Auto-Remap)".to_string(),
+                context_length: 200000,
+                max_output_tokens: 32000,
+                is_free: true,
+            });
+        }
         None
     }
 }
