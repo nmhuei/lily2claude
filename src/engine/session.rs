@@ -159,6 +159,11 @@ impl AcpSession {
 
         while let Some(line) = self.reader.next_line().await? {
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                let update_type = v.pointer("/params/update/sessionUpdate").and_then(|u| u.as_str());
+                if update_type == Some("agent_thought_chunk") {
+                    continue;
+                }
+
                 // Parse text chunks from either object or array
                 if let Some(text) = v
                     .pointer("/params/update/content/text")

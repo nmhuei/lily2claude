@@ -1,39 +1,17 @@
 use super::{Agent, AuthStatus};
-use crate::adapters::http_upstream::HttpUpstreamAdapter;
-use crate::config::warp_pool::WarpPool;
+use crate::adapters::acp_client::AcpClient;
 use crate::discovery::catalog::ModelMetadata;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
-#[derive(Clone)]
-pub struct OpenCodeAgent {
-    warp_pool: Arc<WarpPool>,
-    endpoint: String,
-}
-
-impl Default for OpenCodeAgent {
-    fn default() -> Self {
-        let pool = Arc::new(WarpPool::new(vec![
-            "socks5h://127.0.0.1:40001".to_string(),
-            "socks5h://127.0.0.1:40002".to_string(),
-        ]));
-        Self {
-            warp_pool: pool,
-            endpoint: "https://opencode.ai/inference/openai/v1".to_string(),
-        }
-    }
-}
+#[derive(Debug, Clone, Default)]
+pub struct OpenCodeAgent;
 
 impl OpenCodeAgent {
     pub fn auth_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/light".to_string());
         Path::new(&home).join(".local/share/opencode/auth.json")
-    }
-
-    pub fn warp_pool(&self) -> Arc<WarpPool> {
-        self.warp_pool.clone()
     }
 }
 
@@ -44,7 +22,7 @@ impl Agent for OpenCodeAgent {
     }
 
     fn display_name(&self) -> &'static str {
-        "OpenCode Cloud"
+        "OpenCode"
     }
 
     fn detect_installation(&self) -> (bool, Option<String>, Option<String>) {
@@ -126,37 +104,23 @@ impl Agent for OpenCodeAgent {
         model: &str,
         prompt: &str,
         session_key: Option<&str>,
-        _session_mgr: Option<&crate::engine::session::SessionManager>,
+        session_mgr: Option<&crate::engine::session::SessionManager>,
         tx: mpsc::Sender<String>,
     ) -> anyhow::Result<()> {
-        let adapter = HttpUpstreamAdapter::new(
-            &self.endpoint,
-            None,
-            Some((*self.warp_pool).clone()),
-        );
-        let req = crate::protocol::openai::ChatCompletionsRequest {
-            model: model.to_string(),
-            messages: vec![crate::protocol::openai::OpenAiMessage {
-                role: "user".to_string(),
-                content: Some(prompt.to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            tools: None,
-            stream: true,
-            max_tokens: None,
-            temperature: None,
+        let clean_model = model.strip_prefix("opencode:").unwrap_or(model);
+        let qualified_model = if clean_model.contains('/') {
+            clean_model.to_string()
+        } else {
+            format!("opencode/{}", clean_model)
         };
-        let response = adapter.send_request_with_session(&req, session_key).await?;
-        let mut stream = response.bytes_stream();
-        use futures_util::StreamExt;
-        while let Some(item) = stream.next().await {
-            if let Ok(bytes) = item {
-                if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                    let _ = tx.send(text).await;
-                }
-            }
+        let cmd = vec!["opencode".to_string(), "acp".to_string()];
+        if let (Some(mgr), Some(key)) = (session_mgr, session_key) {
+            let session = mgr.get_or_create(key, self.id(), &cmd).await?;
+            let mut lock = session.lock().await;
+            lock.send_prompt(&qualified_model, prompt, tx).await
+        } else {
+            let client = AcpClient::new(cmd);
+            client.run_prompt(&qualified_model, prompt, tx).await
         }
-        Ok(())
     }
 }

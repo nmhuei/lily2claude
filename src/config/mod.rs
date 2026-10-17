@@ -28,15 +28,15 @@ impl Config {
         let mut aliases = agent_reg.default_aliases();
 
         let deepseek_targets = vec![
-            "commandcode:deepseek/deepseek-v4.1-flash".to_string(),
             "opencode:deepseek-v4.1-flash-free".to_string(),
+            "commandcode:deepseek/deepseek-v4.1-flash".to_string(),
             "kilo:kilo-auto/free".to_string(),
         ];
 
         // Ensure transparent aliases have full fallbacks
-        aliases.entry("deepseek".to_string()).or_insert_with(|| deepseek_targets.clone());
-        aliases.entry("deepseek-v4.1-flash".to_string()).or_insert_with(|| deepseek_targets.clone());
-        aliases.entry("deepseek/deepseek-v4.1-flash".to_string()).or_insert_with(|| deepseek_targets.clone());
+        aliases.insert("deepseek".to_string(), deepseek_targets.clone());
+        aliases.insert("deepseek-v4.1-flash".to_string(), deepseek_targets.clone());
+        aliases.insert("deepseek/deepseek-v4.1-flash".to_string(), deepseek_targets.clone());
 
         // Map Anthropic subagent models transparently to DeepSeek V4.1 Flash
         for anthropic_model in &[
@@ -77,15 +77,12 @@ impl Config {
             "opencode".to_string(),
             ProviderConfig {
                 name: "opencode".to_string(),
-                kind: "opencode_free".to_string(),
-                endpoint: Some("https://opencode.ai/inference/openai/v1".to_string()),
-                command: None,
+                kind: "acp_stdio".to_string(),
+                endpoint: None,
+                command: Some(vec!["opencode".to_string(), "acp".to_string()]),
                 auth_file: Some("/home/light/.local/share/opencode/auth.json".to_string()),
                 auth_token: None,
-                warp_proxies: Some(vec![
-                    "socks5h://127.0.0.1:40001".to_string(),
-                    "socks5h://127.0.0.1:40002".to_string(),
-                ]),
+                warp_proxies: None,
             },
         );
         providers.insert(

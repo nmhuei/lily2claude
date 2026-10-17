@@ -2,14 +2,14 @@ use lily2claude::config::Config;
 use lily2claude::engine::router::EngineRouter;
 
 #[test]
-fn test_router_prioritizes_local_acp_over_cloud_for_deepseek() {
+fn test_router_prioritizes_opencode_over_acp_for_deepseek() {
     let config = Config::load_default();
     let router = EngineRouter::new(config);
 
     let candidates = router.resolve_alias("deepseek");
     assert!(!candidates.is_empty());
-    assert_eq!(candidates[0].provider, "commandcode");
-    assert_eq!(candidates[1].provider, "opencode");
+    assert_eq!(candidates[0].provider, "opencode");
+    assert_eq!(candidates[1].provider, "commandcode");
 }
 
 #[test]
@@ -29,7 +29,7 @@ fn test_router_resolves_claude_subagent_models_to_deepseek() {
     ] {
         let candidates = router.resolve_alias(subagent_model);
         assert!(!candidates.is_empty(), "Failed to resolve subagent model: {}", subagent_model);
-        assert_eq!(candidates[0].provider, "commandcode");
-        assert_eq!(candidates[0].model, "deepseek/deepseek-v4.1-flash");
+        assert_eq!(candidates[0].provider, "opencode");
+        assert_eq!(candidates[0].model, "deepseek-v4.1-flash-free");
     }
 }
