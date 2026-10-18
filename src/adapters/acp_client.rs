@@ -92,10 +92,26 @@ impl AcpClient {
         }
 
         // 2. session/new
-        let cwd = std::env::current_dir()
+        let mut cwd = std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("/home/light"))
             .to_string_lossy()
             .to_string();
+
+        for line in prompt.lines() {
+            if let Some(rest) = line.trim().strip_prefix("- Primary working directory:") {
+                let p = rest.trim();
+                let dir = if let Some(idx) = p.find(" (was ") {
+                    &p[..idx]
+                } else {
+                    p
+                };
+                if std::path::Path::new(dir).is_dir() {
+                    cwd = dir.to_string();
+                    break;
+                }
+            }
+        }
+
         let session_req = json!({
             "jsonrpc": "2.0",
             "id": 2,

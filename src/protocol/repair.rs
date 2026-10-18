@@ -21,6 +21,12 @@ pub fn repair_tool_arguments(raw: &str) -> String {
         return candidate;
     }
 
+    // Fix unclosed quote if truncated inside string
+    let quote_count = candidate.chars().filter(|c| *c == '"').count();
+    if quote_count % 2 == 1 {
+        candidate.push('"');
+    }
+
     // Fix trailing comma in objects
     if candidate.contains(",}") {
         candidate = candidate.replace(",}", "}");
@@ -29,9 +35,23 @@ pub fn repair_tool_arguments(raw: &str) -> String {
     if candidate.contains(",]") {
         candidate = candidate.replace(",]", "]");
     }
-    // Balance open brace
-    if candidate.starts_with('{') && !candidate.ends_with('}') {
-        candidate.push('}');
+
+    // Balance unclosed braces
+    let open_braces = candidate.chars().filter(|c| *c == '{').count();
+    let close_braces = candidate.chars().filter(|c| *c == '}').count();
+    if open_braces > close_braces {
+        for _ in 0..(open_braces - close_braces) {
+            candidate.push('}');
+        }
+    }
+
+    // Balance unclosed brackets
+    let open_brackets = candidate.chars().filter(|c| *c == '[').count();
+    let close_brackets = candidate.chars().filter(|c| *c == ']').count();
+    if open_brackets > close_brackets {
+        for _ in 0..(open_brackets - close_brackets) {
+            candidate.push(']');
+        }
     }
 
     if serde_json::from_str::<Value>(&candidate).is_ok() {
@@ -65,6 +85,35 @@ static RE_BASH_FENCE: LazyLock<Regex> =
 pub struct ToolCallRepairEngine;
 
 impl ToolCallRepairEngine {
+    /// Strips any raw XML tool call tags or unclosed tool markers from text intended for user display.
+    pub fn clean_user_visible_text(raw: &str) -> String {
+        let mut text = raw.to_string();
+        text = RE_TOOL_CALL.replace_all(&text, "").to_string();
+        text = RE_INVOKE.replace_all(&text, "").to_string();
+        text = RE_FUNCTION_CALL.replace_all(&text, "").to_string();
+
+        // Only strip unclosed opening tags if there is no closing tag
+        for tag in ["<tool_call", "<invoke", "<function_call"] {
+            if let Some(pos) = text.rfind(tag) {
+                let close_tag = match tag {
+                    "<tool_call" => "</tool_call>",
+                    "<invoke" => "</invoke>",
+                    "<function_call" => "</function_call>",
+                    _ => "",
+                };
+                if !close_tag.is_empty() && !text[pos..].contains(close_tag) {
+                    text.truncate(pos);
+                }
+            }
+        }
+
+        text.replace("</tool_call>", "")
+            .replace("</invoke>", "")
+            .replace("</function_call>", "")
+            .trim()
+            .to_string()
+    }
+
     pub fn get_streamable_text_end(s: &str) -> usize {
         let tool_markers = [
             "<tool_call",
@@ -179,8 +228,14 @@ impl ToolCallRepairEngine {
             "send_message" | "sendmessage" => {
                 casing_map.get("sendmessage").cloned().unwrap_or_else(|| "SendMessage".to_string())
             }
-            "task_stop" | "taskstop" => {
-                casing_map.get("taskstop").cloned().unwrap_or_else(|| "TaskStop".to_string())
+            "skill" | "call_skill" | "load_skill" | "run_skill" => {
+                casing_map.get("skill").cloned().unwrap_or_else(|| "Skill".to_string())
+            }
+            "workflow" | "run_workflow" => {
+                casing_map.get("workflow").cloned().unwrap_or_else(|| "Workflow".to_string())
+            }
+            "other" => {
+                "other".to_string()
             }
             other => {
                 if let Some(cased) = casing_map.get(other) {
@@ -276,15 +331,6 @@ impl ToolCallRepairEngine {
                     }
                 }
 
-                // Remove cwd and merge into command
-                if let Some(cwd) = obj.remove("cwd").or_else(|| obj.remove("working_directory")).and_then(|v| v.as_str().map(|s| s.to_string())) {
-                    if let Some(cmd) = obj.get("command").and_then(|v| v.as_str().map(|s| s.to_string())) {
-                        if !cmd.starts_with("cd ") {
-                            obj.insert("command".to_string(), serde_json::Value::String(format!("cd {} && {}", cwd, cmd)));
-                        }
-                    }
-                }
-
                 // Timeout string normalization
                 if let Some(to_val) = obj.get("timeout") {
                     if let Some(s) = to_val.as_str() {
@@ -294,9 +340,10 @@ impl ToolCallRepairEngine {
                     }
                 }
 
-                // Strip unsupported keys that models hallucinate
-                obj.remove("language");
-                obj.remove("interpreter");
+                // Strictly retain only valid Claude Code Bash parameters: command, description, timeout
+                // Note: Never prepend cd before git because Claude Code security sandbox explicitly denies it.
+                // Claude Code CLI is already running in the workspace directory.
+                obj.retain(|k, _| k == "command" || k == "description" || k == "timeout");
             } else if lower_target == "read" || lower_target == "view" {
                 let target_param = if lower_target == "view" { "path" } else { "file_path" };
                 let alt_param = if lower_target == "view" { "file_path" } else { "path" };
@@ -374,9 +421,8 @@ impl ToolCallRepairEngine {
                     }
                 }
 
-                // Strip unsupported keys
-                obj.remove("encoding");
-                obj.remove("mode");
+                // Strictly retain only valid Claude Code Read parameters: file_path, offset, limit
+                obj.retain(|k, _| k == "file_path" || k == "offset" || k == "limit");
             } else if lower_target == "edit" {
                 if let Some(val) = obj.remove("path")
                     .or_else(|| obj.remove("file"))
@@ -417,12 +463,8 @@ impl ToolCallRepairEngine {
                     }
                 }
 
-                // Strip extraneous keys
-                obj.remove("instruction");
-                obj.remove("comment");
-                obj.remove("explanation");
-                obj.remove("start_line");
-                obj.remove("end_line");
+                // Strictly retain only valid Claude Code Edit parameters: file_path, old_string, new_string, replace_all
+                obj.retain(|k, _| k == "file_path" || k == "old_string" || k == "new_string" || k == "replace_all");
             } else if lower_target == "write" {
                 if let Some(val) = obj.remove("path")
                     .or_else(|| obj.remove("file"))
@@ -445,9 +487,9 @@ impl ToolCallRepairEngine {
                         obj.insert("content".to_string(), t);
                     }
                 }
-                obj.remove("append");
-                obj.remove("overwrite");
-                obj.remove("encoding");
+
+                // Strictly retain only valid Claude Code Write parameters: file_path, content
+                obj.retain(|k, _| k == "file_path" || k == "content");
             } else if lower_target == "websearch" {
                 if let Some(q) = obj.remove("q")
                     .or_else(|| obj.remove("search_query"))
@@ -518,6 +560,12 @@ impl ToolCallRepairEngine {
                         obj.insert("message".to_string(), m);
                     }
                 }
+            } else if lower_target == "skill" {
+                if let Some(s) = obj.remove("name").or_else(|| obj.remove("skill_name")).or_else(|| obj.remove("skill")) {
+                    obj.insert("skill".to_string(), s);
+                }
+                obj.remove("arguments");
+                obj.remove("args");
             }
         }
         args
@@ -558,6 +606,30 @@ impl ToolCallRepairEngine {
             if !has_path || !has_old || !has_new {
                 return None;
             }
+        } else if lower == "skill" {
+            let has_skill = norm_args.get("skill").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
+            if !has_skill {
+                return None;
+            }
+        } else if lower == "other" {
+            // Check if this was a Skill invocation (e.g. OpenCode ACP sends kind="other" for skills)
+            if let Some(skill_name) = norm_args.get("skill").or_else(|| norm_args.get("name")).and_then(|v| v.as_str()) {
+                if !skill_name.trim().is_empty() && casing_map.contains_key("skill") {
+                    mapped_name = casing_map.get("skill").cloned().unwrap_or_else(|| "Skill".to_string());
+                    norm_args = serde_json::json!({
+                        "skill": skill_name
+                    });
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+
+        // Drop any tool not declared by Claude Code to prevent "No such tool available" fatal error
+        if !casing_map.is_empty() && !casing_map.contains_key(&mapped_name.to_ascii_lowercase()) {
+            return None;
         }
 
         Some(RepairedToolCall {
@@ -798,7 +870,18 @@ mod tests {
         let calls = ToolCallRepairEngine::detect_and_extract(text, &map);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Bash");
-        assert_eq!(calls[0].arguments["command"], "cd /home/user/project && cargo test");
+        assert_eq!(calls[0].arguments["command"], "cargo test");
         assert!(calls[0].arguments.get("cwd").is_none());
+    }
+
+    #[test]
+    fn test_clean_user_visible_text_preserves_post_tool_text() {
+        let text = "Rà soát cấu trúc repo:\n<tool_call>\n{\"name\": \"Bash\", \"arguments\": {\"command\": \"ls\"}}\n</tool_call>\n\n## Sẵn sàng spawn subagent\n1. Chuẩn hóa README\n2. Hoàn thiện toàn diện";
+        let cleaned = ToolCallRepairEngine::clean_user_visible_text(text);
+        assert!(cleaned.contains("Rà soát cấu trúc repo:"));
+        assert!(cleaned.contains("## Sẵn sàng spawn subagent"));
+        assert!(cleaned.contains("1. Chuẩn hóa README"));
+        assert!(!cleaned.contains("<tool_call>"));
+        assert!(!cleaned.contains("</tool_call>"));
     }
 }

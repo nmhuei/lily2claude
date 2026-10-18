@@ -175,10 +175,25 @@ impl AcpSession {
         // 1. Create a fresh session for this turn to guarantee clean context
         self.rpc_id += 1;
         let session_call_id = self.rpc_id;
-        let cwd = std::env::current_dir()
+        let mut cwd = std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("/home/light"))
             .to_string_lossy()
             .to_string();
+
+        for line in prompt.lines() {
+            if let Some(rest) = line.trim().strip_prefix("- Primary working directory:") {
+                let p = rest.trim();
+                let dir = if let Some(idx) = p.find(" (was ") {
+                    &p[..idx]
+                } else {
+                    p
+                };
+                if std::path::Path::new(dir).is_dir() {
+                    cwd = dir.to_string();
+                    break;
+                }
+            }
+        }
 
         let session_req = json!({
             "jsonrpc": "2.0",
@@ -191,9 +206,11 @@ impl AcpSession {
 
         let mut current_session_id = None;
         while let Some(line) = self.reader.next_line().await? {
+            eprintln!("[ACP session/new raw] {}", &line[..line.len().min(120)]);
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
                 if v.get("id").and_then(|id| id.as_u64()) == Some(session_call_id) {
                     if let Some(err) = v.get("error") {
+                        eprintln!("[ACP session/new error] {:?}", err);
                         anyhow::bail!("ACP session/new failed: {:?}", err);
                     }
                     if let Some(sid) = v.pointer("/result/sessionId").and_then(|s| s.as_str()) {
@@ -207,6 +224,7 @@ impl AcpSession {
         let current_session_id = current_session_id.ok_or_else(|| {
             anyhow::anyhow!("Failed to acquire sessionId from ACP session/new")
         })?;
+        eprintln!("[ACP session/new acquired] sid={}", current_session_id);
 
         // 2. session/prompt
         self.rpc_id += 1;
@@ -223,11 +241,20 @@ impl AcpSession {
         });
         self.stdin.write_all(format!("{}\n", prompt_req).as_bytes()).await?;
         self.stdin.flush().await?;
+        eprintln!("[ACP session/prompt sent] id={}", prompt_call_id);
 
+        let _ = std::fs::write("/tmp/last_acp_prompt.txt", prompt);
         let mut captured_usage: Option<crate::protocol::tokens::TokenUsage> = None;
         let mut prompt_err = None;
 
+        let mut emitted_tool_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         while let Some(line) = self.reader.next_line().await? {
+            eprintln!("[ACP prompt raw] {}", &line[..line.len().min(120)]);
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/acp_raw.log") {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", line);
+            }
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
                 let update_type = v.pointer("/params/update/sessionUpdate").and_then(|u| u.as_str());
                 if update_type == Some("agent_thought_chunk") {
@@ -252,6 +279,7 @@ impl AcpSession {
                     .pointer("/params/update/content/text")
                     .or_else(|| v.pointer("/params/update/content/0/text"))
                     .or_else(|| v.pointer("/params/content/text"))
+                    .or_else(|| v.pointer("/params/content"))
                     .and_then(|t| t.as_str())
                 {
                     if !text.is_empty() {
@@ -268,7 +296,15 @@ impl AcpSession {
                     }
                 }
 
-                if update_type == Some("tool_call") {
+                if update_type == Some("tool_call") || update_type == Some("tool_call_update") {
+                    let call_id = v.pointer("/params/update/toolCallId")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("");
+
+                    if !call_id.is_empty() && emitted_tool_calls.contains(call_id) {
+                        continue;
+                    }
+
                     let input_val = v.pointer("/params/update/rawInput")
                         .or_else(|| v.pointer("/params/update/input"))
                         .unwrap_or(&serde_json::Value::Null);
@@ -284,6 +320,19 @@ impl AcpSession {
                             "read" | "file_read" | "view" => ("Read".to_string(), input_val.clone()),
                             "edit" | "file_edit" => ("Edit".to_string(), input_val.clone()),
                             "write" | "file_write" => ("Write".to_string(), input_val.clone()),
+                            "skill" | "call_skill" => {
+                                let s_name = input_val.get("skill").or_else(|| input_val.get("name")).and_then(|s| s.as_str()).unwrap_or("");
+                                ("Skill".to_string(), serde_json::json!({"skill": s_name}))
+                            }
+                            "other" => {
+                                if let Some(skill_name) = input_val.get("skill").or_else(|| input_val.get("name")).and_then(|s| s.as_str()) {
+                                    ("Skill".to_string(), serde_json::json!({"skill": skill_name}))
+                                } else if let Some(title) = v.pointer("/params/update/title").and_then(|t| t.as_str()) {
+                                    (title.to_string(), input_val.clone())
+                                } else {
+                                    ("Bash".to_string(), input_val.clone())
+                                }
+                            }
                             "ls" | "dir" | "list_directory" => {
                                 let path = input_val.get("path").or_else(|| input_val.get("directory")).and_then(|p| p.as_str()).unwrap_or(".");
                                 ("Bash".to_string(), serde_json::json!({"command": format!("ls -la {}", path)}))
@@ -310,6 +359,24 @@ impl AcpSession {
                         ("Bash".to_string(), input_val.clone())
                     };
 
+                    // Check that tool input is actually complete/usable before emitting to Claude Code
+                    let is_ready = match tool_name.to_lowercase().as_str() {
+                        "bash" => tool_input.get("command").and_then(|c| c.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false),
+                        "read" => tool_input.get("file_path").or_else(|| tool_input.get("path")).and_then(|p| p.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false),
+                        "edit" => tool_input.get("file_path").or_else(|| tool_input.get("path")).is_some() && tool_input.get("old_string").is_some(),
+                        "write" => tool_input.get("file_path").or_else(|| tool_input.get("path")).is_some(),
+                        "skill" => tool_input.get("skill").or_else(|| tool_input.get("name")).is_some(),
+                        _ => true,
+                    };
+
+                    if !is_ready {
+                        continue;
+                    }
+
+                    if !call_id.is_empty() {
+                        emitted_tool_calls.insert(call_id.to_string());
+                    }
+
                     let tool_str = format!("\n<tool_call>\n{{\"name\": \"{}\", \"arguments\": {}}}\n</tool_call>\n", tool_name, tool_input);
                     let _ = tx.send(crate::protocol::tokens::AcpOutputChunk::Text(tool_str)).await;
                 }
@@ -328,10 +395,13 @@ impl AcpSession {
                 let is_matching_result = v.get("id").and_then(|id| id.as_u64()) == Some(prompt_call_id);
 
                 if is_stop || (is_matching_result && (v.get("result").is_some() || v.get("error").is_some())) {
+                    eprintln!("[ACP prompt broke] is_stop={} is_matching_result={}", is_stop, is_matching_result);
                     break;
                 }
             }
         }
+        eprintln!("[ACP prompt reader ended] final_usage={:?} prompt_err={:?}", captured_usage, prompt_err);
+        eprintln!("[ACP child exit status] {:?}", self.child.try_wait());
 
         if let Some(err) = prompt_err {
             let err_str = err.to_string();
@@ -450,16 +520,14 @@ impl SessionManager {
         let mut lock = self.sessions.lock().await;
         let mut to_remove = Vec::new();
 
-        for (k, (pid, sess)) in lock.iter() {
+        for (k, (_pid, sess)) in lock.iter() {
             if let Ok(mut s) = sess.try_lock() {
                 if s.last_used.elapsed() > max_idle {
                     let _ = s.child.kill().await;
                     to_remove.push(k.clone());
                 }
-            } else if let Some(p) = pid {
-                let _ = tokio::process::Command::new("kill").args(["-9", &p.to_string()]).output().await;
-                to_remove.push(k.clone());
             }
+            // If try_lock() fails, session is currently processing a request - NOT idle, do not kill!
         }
 
         for k in to_remove {

@@ -29,6 +29,10 @@ pub fn build_settings_json(model: &str, port: u16, context_tokens: u32) -> Strin
             "CLAUDE_CODE_DISABLE_MODEL_ACCESS_FALLBACK": "1",
             "CLAUDE_CODE_NO_MODEL_FALLBACK": "1",
             "CLAUDE_CODE_MAX_CONTEXT_TOKENS": context_tokens.to_string(),
+            "API_TIMEOUT_MS": "600000",
+            "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS": "600000",
+            "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "600000",
+            "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": "600000",
         }
     })
     .to_string()
@@ -86,6 +90,10 @@ pub fn launch_claude(model: &str, port: u16, extra_args: &[String]) -> anyhow::R
     cmd.env("CLAUDE_CODE_DISABLE_MODEL_ACCESS_FALLBACK", "1");
     cmd.env("CLAUDE_CODE_NO_MODEL_FALLBACK", "1");
     cmd.env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", ctx.to_string());
+    cmd.env("API_TIMEOUT_MS", "600000");
+    cmd.env("CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS", "600000");
+    cmd.env("CLAUDE_STREAM_IDLE_TIMEOUT_MS", "600000");
+    cmd.env("CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS", "600000");
 
     cmd.arg("--settings").arg(&settings);
     cmd.arg("--model").arg(&cli_model);
@@ -103,8 +111,19 @@ pub fn launch_claude(model: &str, port: u16, extra_args: &[String]) -> anyhow::R
         cmd.arg("--session-id").arg(fresh_id);
     }
 
-    for arg in extra_args {
-        cmd.arg(arg);
+    let mut i = 0;
+    while i < extra_args.len() {
+        let arg = &extra_args[i];
+        if arg == "--effort" && i + 1 < extra_args.len() && extra_args[i + 1].eq_ignore_ascii_case("ultra") {
+            cmd.arg("--effort").arg("max");
+            i += 2;
+        } else if arg.eq_ignore_ascii_case("--effort=ultra") {
+            cmd.arg("--effort=max");
+            i += 1;
+        } else {
+            cmd.arg(arg);
+            i += 1;
+        }
     }
 
     let status = cmd.status()?;

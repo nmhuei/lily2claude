@@ -102,9 +102,32 @@ async fn messages_handler(
 
     let tools_summary: Vec<String> = req.tools.as_ref().map(|ts| ts.iter().map(|t| t.name.clone()).collect()).unwrap_or_default();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    let last_preview = req.messages.last().map(|m| {
+        let text = match &m.content {
+            AnthropicContent::Text(t) => t.clone(),
+            AnthropicContent::Blocks(b) => {
+                b.iter().map(|block| match block {
+                    ContentBlock::Text { text } => text.clone(),
+                    ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                        format!("tool_result({}): err={:?} content={}", tool_use_id, is_error, content)
+                    },
+                    ContentBlock::ToolUse { id, name, input } => {
+                        format!("tool_use({} - {}): {}", name, id, input)
+                    },
+                    ContentBlock::Thinking { thinking, .. } => {
+                        format!("thinking: {}", thinking)
+                    }
+                }).collect::<Vec<_>>().join(" | ")
+            }
+        };
+        let preview = text.chars().take(200).collect::<String>().replace('\n', " ");
+        format!("[{}] {}", m.role, preview)
+    }).unwrap_or_default();
+
     let log_line = format!(
-        "[ts={}] [REQ] model={} stream={} tools={:?} msgs={}\n",
-        now, req.model, req.stream, tools_summary, req.messages.len()
+        "[ts={}] [REQ] model={} stream={} tools={:?} msgs={} last={}\n",
+        now, req.model, req.stream, tools_summary, req.messages.len(), last_preview
     );
     eprint!("{}", log_line);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/lily2claude_traffic.log") {
@@ -168,6 +191,17 @@ async fn messages_handler(
             match http_adapter.send_request_with_session(&openai_req, Some(&session_key)).await {
                 Ok(upstream_resp) => {
                     if !upstream_resp.status().is_success() {
+                        let status = upstream_resp.status();
+                        let body = upstream_resp.text().await.unwrap_or_default();
+                        let fail_line = format!(
+                            "[ts={}] [UPSTREAM_FAIL] provider={} model={} status={} body={}\n",
+                            now, target.provider, target.model, status, body.replace('\n', " ")
+                        );
+                        eprint!("{}", fail_line);
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/lily2claude_traffic.log") {
+                            use std::io::Write;
+                            let _ = f.write_all(fail_line.as_bytes());
+                        }
                         state.router.mark_provider_degraded(&target.provider, 180);
                         continue; // Rate limited or errored, try next candidate
                     }
@@ -195,6 +229,22 @@ async fn messages_handler(
                                         }
                                         let events = translator.feed_chunk(data);
                                         for ev in events {
+                                            if ev.event == "content_block_start" && ev.data.get("content_block").and_then(|b| b.get("type")).and_then(|t| t.as_str()) == Some("tool_use") {
+                                                let tool_name = ev.data["content_block"]["name"].as_str().unwrap_or("unknown");
+                                                let tool_id = ev.data["content_block"]["id"].as_str().unwrap_or("unknown");
+                                                let t_log = format!("[ts={}] [SSE_TOOL] name={} id={}\n", now, tool_name, tool_id);
+                                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/lily2claude_traffic.log") {
+                                                    use std::io::Write;
+                                                    let _ = f.write_all(t_log.as_bytes());
+                                                }
+                                            } else if ev.event == "content_block_delta" && ev.data.get("delta").and_then(|d| d.get("type")).and_then(|t| t.as_str()) == Some("input_json_delta") {
+                                                let args = ev.data["delta"]["partial_json"].as_str().unwrap_or("");
+                                                let a_log = format!("[ts={}] [SSE_TOOL_INPUT] {}\n", now, args.replace('\n', " "));
+                                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/lily2claude_traffic.log") {
+                                                    use std::io::Write;
+                                                    let _ = f.write_all(a_log.as_bytes());
+                                                }
+                                            }
                                             let _ = tx
                                                 .send(Ok(Event::default()
                                                     .event(ev.event)
@@ -306,7 +356,7 @@ async fn messages_handler(
             let p_text = prompt_text.clone();
 
             let exec_task = tokio::spawn(async move {
-                agent_clone
+                let res = agent_clone
                     .execute_turn(
                         &model_clone,
                         &p_text,
@@ -314,264 +364,74 @@ async fn messages_handler(
                         Some(&session_mgr),
                         prompt_tx,
                     )
-                    .await
+                    .await;
+                if let Err(ref e) = res {
+                    eprintln!(">>> EXECUTE_TURN FAILED: {:?}", e);
+                } else {
+                    eprintln!(">>> EXECUTE_TURN FINISHED OK");
+                }
+                res
             });
 
-            // Wait for first chunk (text or thinking) to guarantee candidate is responsive (max 60s timeout)
-            let mut initial_usage: Option<crate::protocol::tokens::TokenUsage> = None;
-            let first_chunk_timeout = std::time::Duration::from_secs(60);
-
-            let recv_res = tokio::time::timeout(first_chunk_timeout, async {
-                while let Some(chunk) = prompt_rx.recv().await {
-                    match &chunk {
-                        crate::protocol::tokens::AcpOutputChunk::Text(t) => {
-                            if !t.is_empty() {
-                                if t.contains("provider.quota")
-                                    || t.contains("Rate limit exceeded")
-                                    || t.contains("rate limit exceeded")
-                                    || t.contains("at capacity")
-                                    || t.contains("429")
-                                {
-                                    tracing::warn!(candidate = %target.provider, error = %t, "Candidate hit rate limit/quota, trying next candidate...");
-                                    return None;
-                                }
-                                return Some(chunk);
-                            }
-                        }
-                        crate::protocol::tokens::AcpOutputChunk::Thinking(th) => {
-                            if !th.is_empty() {
-                                return Some(chunk);
-                            }
-                        }
-                        crate::protocol::tokens::AcpOutputChunk::Usage(u) => {
-                            initial_usage = Some(*u);
-                        }
-                    }
-                }
-                None
-            })
-            .await;
-
-            let first_chunk = match recv_res {
-                Ok(Some(chunk)) => chunk,
-                _ => {
-                    tracing::warn!(candidate = %target.provider, model = %target.model, "Candidate timed out or closed without output, marking degraded and attempting next candidate...");
-                    exec_task.abort();
-                    state.session_mgr.evict_session(&session_key, &target.provider).await;
-                    state.router.mark_provider_degraded(&target.provider, 300);
-                    if target.provider == "opencode" {
-                        if let Some(pool) = state.session_mgr.warp_pool() {
-                            pool.mark_rate_limited("http://127.0.0.1:40001", 300);
-                            pool.mark_rate_limited("http://127.0.0.1:40002", 300);
-                            pool.mark_rate_limited("http://127.0.0.1:40010", 300);
-                        }
-                    }
-                    continue;
-                }
-            };
             let (sse_tx, sse_rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(128);
             let tools_decl = req.tools.clone().unwrap_or_default();
             let s_key_clone = session_key.clone();
             let req_model_clone = req.model.clone();
             let tracker_clone = state.token_tracker.clone();
 
+            let mut casing_map = std::collections::HashMap::new();
+            for t in &tools_decl {
+                casing_map.insert(t.name.to_ascii_lowercase(), t.name.clone());
+            }
+
             tokio::spawn(async move {
-                let start_ev = json!({
-                    "type": "message_start",
-                    "message": {
-                        "id": "msg_live_acp",
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": req_model_clone,
-                        "stop_reason": null,
-                        "stop_sequence": null,
-                        "usage": {
-                            "input_tokens": calculated_input_tokens,
-                            "output_tokens": 1,
-                            "cache_creation_input_tokens": 0,
-                            "cache_read_input_tokens": 0
-                        }
-                    }
-                });
-                let _ = sse_tx
+                let mut streamer = crate::protocol::stream::AnthropicBlockStreamer::new(
+                    "msg_live_acp",
+                    &req_model_clone,
+                    calculated_input_tokens,
+                    casing_map,
+                );
+
+                let start_ev = streamer.start();
+                if sse_tx
                     .send(Ok(Event::default()
-                        .event("message_start")
-                        .data(start_ev.to_string())))
-                    .await;
-
-                #[derive(PartialEq)]
-                enum ActiveBlock {
-                    None,
-                    Thinking(usize),
-                    Text(usize),
+                        .event(start_ev.event)
+                        .data(start_ev.data.to_string())))
+                    .await
+                    .is_err()
+                {
+                    exec_task.abort();
+                    return;
                 }
 
-                let mut current_block = ActiveBlock::None;
-                let mut next_block_index = 0usize;
-                let mut accumulated = String::new();
-                let mut streamed_text_len = 0usize;
-                let mut captured_usage: Option<crate::protocol::tokens::TokenUsage> = initial_usage;
+                let mut captured_usage: Option<crate::protocol::tokens::TokenUsage> = None;
+                let inter_chunk_timeout = std::time::Duration::from_secs(300);
 
-                // Process initial chunk
-                match first_chunk {
-                    crate::protocol::tokens::AcpOutputChunk::Thinking(th) => {
-                        let idx = next_block_index;
-                        next_block_index += 1;
-                        let blk_start = json!({
-                            "type": "content_block_start",
-                            "index": idx,
-                            "content_block": {"type": "thinking", "thinking": ""}
-                        });
-                        let _ = sse_tx.send(Ok(Event::default().event("content_block_start").data(blk_start.to_string()))).await;
-                        let delta = json!({
-                            "type": "content_block_delta",
-                            "index": idx,
-                            "delta": {"type": "thinking_delta", "thinking": th}
-                        });
-                        let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(delta.to_string()))).await;
-                        current_block = ActiveBlock::Thinking(idx);
-                    }
-                    crate::protocol::tokens::AcpOutputChunk::Text(t) => {
-                        accumulated.push_str(&t);
-                        let streamable_end = get_streamable_text_end(&accumulated);
-                        if streamable_end > streamed_text_len {
-                            let to_stream = &accumulated[streamed_text_len..streamable_end];
-                            let idx = next_block_index;
-                            next_block_index += 1;
-                            let blk_start = json!({
-                                "type": "content_block_start",
-                                "index": idx,
-                                "content_block": {"type": "text", "text": ""}
-                            });
-                            let _ = sse_tx.send(Ok(Event::default().event("content_block_start").data(blk_start.to_string()))).await;
-                            let delta = json!({
-                                "type": "content_block_delta",
-                                "index": idx,
-                                "delta": {"type": "text_delta", "text": to_stream}
-                            });
-                            let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(delta.to_string()))).await;
-                            current_block = ActiveBlock::Text(idx);
-                            streamed_text_len = streamable_end;
-                        }
-                    }
-                    crate::protocol::tokens::AcpOutputChunk::Usage(u) => {
-                        captured_usage = Some(u);
-                    }
-                }
-
-                let inter_chunk_timeout = std::time::Duration::from_secs(60);
                 loop {
                     let recv_next = tokio::time::timeout(inter_chunk_timeout, prompt_rx.recv()).await;
                     match recv_next {
                         Ok(Some(item)) => {
-                            match item {
+                            let events = match item {
                                 crate::protocol::tokens::AcpOutputChunk::Thinking(chunk) => {
-                                    if !chunk.is_empty() {
-                                        match current_block {
-                                            ActiveBlock::Thinking(idx) => {
-                                                let delta = json!({
-                                                    "type": "content_block_delta",
-                                                    "index": idx,
-                                                    "delta": {"type": "thinking_delta", "thinking": chunk}
-                                                });
-                                                let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(delta.to_string()))).await;
-                                            }
-                                            ActiveBlock::Text(prev_idx) => {
-                                                let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": prev_idx}).to_string()))).await;
-                                                let idx = next_block_index;
-                                                next_block_index += 1;
-                                                let blk_start = json!({
-                                                    "type": "content_block_start",
-                                                    "index": idx,
-                                                    "content_block": {"type": "thinking", "thinking": ""}
-                                                });
-                                                let _ = sse_tx.send(Ok(Event::default().event("content_block_start").data(blk_start.to_string()))).await;
-                                                let delta = json!({
-                                                    "type": "content_block_delta",
-                                                    "index": idx,
-                                                    "delta": {"type": "thinking_delta", "thinking": chunk}
-                                                });
-                                                let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(delta.to_string()))).await;
-                                                current_block = ActiveBlock::Thinking(idx);
-                                            }
-                                            ActiveBlock::None => {
-                                                let idx = next_block_index;
-                                                next_block_index += 1;
-                                                let blk_start = json!({
-                                                    "type": "content_block_start",
-                                                    "index": idx,
-                                                    "content_block": {"type": "thinking", "thinking": ""}
-                                                });
-                                                let _ = sse_tx.send(Ok(Event::default().event("content_block_start").data(blk_start.to_string()))).await;
-                                                let delta = json!({
-                                                    "type": "content_block_delta",
-                                                    "index": idx,
-                                                    "delta": {"type": "thinking_delta", "thinking": chunk}
-                                                });
-                                                let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(delta.to_string()))).await;
-                                                current_block = ActiveBlock::Thinking(idx);
-                                            }
-                                        }
-                                    }
+                                    streamer.feed_thinking(&chunk)
                                 }
                                 crate::protocol::tokens::AcpOutputChunk::Text(chunk) => {
-                                    if !chunk.is_empty() {
-                                        accumulated.push_str(&chunk);
-                                        let streamable_end = get_streamable_text_end(&accumulated);
-                                        if streamable_end > streamed_text_len {
-                                            let to_stream = &accumulated[streamed_text_len..streamable_end];
-                                            match current_block {
-                                                ActiveBlock::Text(idx) => {
-                                                    let delta = json!({
-                                                        "type": "content_block_delta",
-                                                        "index": idx,
-                                                        "delta": {"type": "text_delta", "text": to_stream}
-                                                    });
-                                                    let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(delta.to_string()))).await;
-                                                }
-                                                ActiveBlock::Thinking(prev_idx) => {
-                                                    let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": prev_idx}).to_string()))).await;
-                                                    let idx = next_block_index;
-                                                    next_block_index += 1;
-                                                    let blk_start = json!({
-                                                        "type": "content_block_start",
-                                                        "index": idx,
-                                                        "content_block": {"type": "text", "text": ""}
-                                                    });
-                                                    let _ = sse_tx.send(Ok(Event::default().event("content_block_start").data(blk_start.to_string()))).await;
-                                                    let delta = json!({
-                                                        "type": "content_block_delta",
-                                                        "index": idx,
-                                                        "delta": {"type": "text_delta", "text": to_stream}
-                                                    });
-                                                    let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(delta.to_string()))).await;
-                                                    current_block = ActiveBlock::Text(idx);
-                                                }
-                                                ActiveBlock::None => {
-                                                    let idx = next_block_index;
-                                                    next_block_index += 1;
-                                                    let blk_start = json!({
-                                                        "type": "content_block_start",
-                                                        "index": idx,
-                                                        "content_block": {"type": "text", "text": ""}
-                                                    });
-                                                    let _ = sse_tx.send(Ok(Event::default().event("content_block_start").data(blk_start.to_string()))).await;
-                                                    let delta = json!({
-                                                        "type": "content_block_delta",
-                                                        "index": idx,
-                                                        "delta": {"type": "text_delta", "text": to_stream}
-                                                    });
-                                                    let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(delta.to_string()))).await;
-                                                    current_block = ActiveBlock::Text(idx);
-                                                }
-                                            }
-                                            streamed_text_len = streamable_end;
-                                        }
-                                    }
+                                    streamer.feed_text(&chunk)
                                 }
                                 crate::protocol::tokens::AcpOutputChunk::Usage(usage) => {
                                     captured_usage = Some(usage);
+                                    Vec::new()
+                                }
+                            };
+
+                            for ev in events {
+                                if sse_tx
+                                    .send(Ok(Event::default().event(ev.event).data(ev.data.to_string())))
+                                    .await
+                                    .is_err()
+                                {
+                                    exec_task.abort();
+                                    return;
                                 }
                             }
                         }
@@ -579,128 +439,16 @@ async fn messages_handler(
                     }
                 }
 
-                let mut casing_map = std::collections::HashMap::new();
-                for t in &tools_decl {
-                    casing_map.insert(t.name.to_ascii_lowercase(), t.name.clone());
-                }
-                let repaired = crate::protocol::repair::ToolCallRepairEngine::detect_and_extract(
-                    &accumulated,
-                    &casing_map,
-                );
-
-                // If no tool calls were repaired, flush any remaining held-back text
-                if repaired.is_empty() && accumulated.len() > streamed_text_len {
-                    let remaining = &accumulated[streamed_text_len..];
-                    match current_block {
-                        ActiveBlock::Text(idx) => {
-                            let delta = json!({
-                                "type": "content_block_delta",
-                                "index": idx,
-                                "delta": {"type": "text_delta", "text": remaining}
-                            });
-                            let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(delta.to_string()))).await;
-                        }
-                        ActiveBlock::Thinking(prev_idx) => {
-                            let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": prev_idx}).to_string()))).await;
-                            let idx = next_block_index;
-                            next_block_index += 1;
-                            let blk_start = json!({
-                                "type": "content_block_start",
-                                "index": idx,
-                                "content_block": {"type": "text", "text": ""}
-                            });
-                            let _ = sse_tx.send(Ok(Event::default().event("content_block_start").data(blk_start.to_string()))).await;
-                            let delta = json!({
-                                "type": "content_block_delta",
-                                "index": idx,
-                                "delta": {"type": "text_delta", "text": remaining}
-                            });
-                            let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(delta.to_string()))).await;
-                            current_block = ActiveBlock::Text(idx);
-                        }
-                        ActiveBlock::None => {
-                            let idx = next_block_index;
-                            next_block_index += 1;
-                            let blk_start = json!({
-                                "type": "content_block_start",
-                                "index": idx,
-                                "content_block": {"type": "text", "text": ""}
-                            });
-                            let _ = sse_tx.send(Ok(Event::default().event("content_block_start").data(blk_start.to_string()))).await;
-                            let delta = json!({
-                                "type": "content_block_delta",
-                                "index": idx,
-                                "delta": {"type": "text_delta", "text": remaining}
-                            });
-                            let _ = sse_tx.send(Ok(Event::default().event("content_block_delta").data(delta.to_string()))).await;
-                            current_block = ActiveBlock::Text(idx);
-                        }
-                    }
-                }
-
-                // Close active block
-                match current_block {
-                    ActiveBlock::Thinking(idx) | ActiveBlock::Text(idx) => {
-                        let _ = sse_tx.send(Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": idx}).to_string()))).await;
-                    }
-                    ActiveBlock::None => {}
-                }
-
-                let mut stop_reason = "end_turn";
-                if !repaired.is_empty() {
-                    for (i, rep) in repaired.iter().enumerate() {
-                        let current_idx = next_block_index + i;
-                        let tc_start = json!({
-                            "type": "content_block_start",
-                            "index": current_idx,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": format!("call_acp_{}_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(), i),
-                                "name": rep.name,
-                                "input": {}
-                            }
-                        });
-                        let _ = sse_tx
-                            .send(Ok(Event::default()
-                                .event("content_block_start")
-                                .data(tc_start.to_string())))
-                            .await;
-                        let tc_delta = json!({
-                            "type": "content_block_delta",
-                            "index": current_idx,
-                            "delta": {"type": "input_json_delta", "partial_json": rep.arguments.to_string()}
-                        });
-                        let _ = sse_tx
-                            .send(Ok(Event::default()
-                                .event("content_block_delta")
-                                .data(tc_delta.to_string())))
-                            .await;
-                        let tc_stop = json!({"type": "content_block_stop", "index": current_idx});
-                        let _ = sse_tx
-                            .send(Ok(Event::default()
-                                .event("content_block_stop")
-                                .data(tc_stop.to_string())))
-                            .await;
-                    }
-                    stop_reason = "tool_use";
-                }
-
-                // Calculate or extract final turn tokens
-                let final_output = captured_usage
-                    .map(|u| u.output_tokens)
-                    .unwrap_or_else(|| {
-                        let text_tok = crate::protocol::tokens::TokenCalculator::count_text(&accumulated);
-                        let tc_tok: usize = repaired.iter().map(|r| {
-                            crate::protocol::tokens::TokenCalculator::count_text(&r.name)
-                                + crate::protocol::tokens::TokenCalculator::count_text(&r.arguments.to_string())
-                                + 8
-                        }).sum();
-                        (text_tok + tc_tok).max(1) as u64
-                    });
-
                 let final_input = captured_usage
                     .map(|u| u.input_tokens)
                     .unwrap_or(calculated_input_tokens);
+
+                let final_output = captured_usage
+                    .map(|u| u.output_tokens)
+                    .unwrap_or_else(|| {
+                        let text_tok = crate::protocol::tokens::TokenCalculator::count_text(&streamer.text_buffer);
+                        (text_tok + streamer.emitted_tool_count * 15).max(1) as u64
+                    });
 
                 let final_cached_read = captured_usage
                     .map(|u| u.cache_read_input_tokens)
@@ -725,28 +473,17 @@ async fn messages_handler(
                     s_key_clone
                 );
 
-                let msg_delta = json!({
-                    "type": "message_delta",
-                    "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-                    "usage": {
-                        "input_tokens": final_usage.input_tokens,
-                        "output_tokens": final_usage.output_tokens,
-                        "cache_read_input_tokens": final_usage.cache_read_input_tokens,
-                        "cache_creation_input_tokens": 0
-                    }
-                });
-                let _ = sse_tx
-                    .send(Ok(Event::default()
-                        .event("message_delta")
-                        .data(msg_delta.to_string())))
-                    .await;
+                let final_events = streamer.finish(
+                    final_usage.input_tokens,
+                    final_usage.output_tokens,
+                    final_usage.cache_read_input_tokens,
+                );
 
-                let msg_stop = json!({"type": "message_stop"});
-                let _ = sse_tx
-                    .send(Ok(Event::default()
-                        .event("message_stop")
-                        .data(msg_stop.to_string())))
-                    .await;
+                for ev in final_events {
+                    let _ = sse_tx
+                        .send(Ok(Event::default().event(ev.event).data(ev.data.to_string())))
+                        .await;
+                }
             });
 
             return Sse::new(ReceiverStream::new(sse_rx))
@@ -791,10 +528,10 @@ pub fn build_acp_prompt(req: &MessagesRequest) -> String {
             for t in tools {
                 let name = &t.name;
                 match name.as_str() {
-                    "Bash" => tool_guide.push_str("- Bash: {\"command\": \"<command>\"} (Run shell commands. NOTE: Always execute commands from the working directory. Do NOT pass 'cwd' parameter; use 'cd <dir> && <cmd>' inside command string if changing directory).\n"),
-                    "Read" => tool_guide.push_str("- Read: {\"file_path\": \"<file_path>\"} (Read file contents from filesystem. Do NOT use FileRead or View; use Read with 'file_path').\n"),
-                    "Edit" => tool_guide.push_str("- Edit: {\"file_path\": \"<file_path>\", \"old_string\": \"<exact text to replace>\", \"new_string\": \"<replacement text>\"} (Replace exact string in file).\n"),
-                    "Write" => tool_guide.push_str("- Write: {\"file_path\": \"<file_path>\", \"content\": \"<file content>\"} (Write file to filesystem).\n"),
+                    "Bash" | "bash" => tool_guide.push_str("- bash: {\"command\": \"<command>\"} (Run shell commands in current project directory. Required parameter: 'command').\n"),
+                    "Read" | "read" => tool_guide.push_str("- read: {\"file_path\": \"<file_path>\"} (Read file contents from filesystem. Required parameter: 'file_path').\n"),
+                    "Edit" | "edit" => tool_guide.push_str("- edit: {\"file_path\": \"<file_path>\", \"old_string\": \"<exact text to replace>\", \"new_string\": \"<replacement text>\"} (Replace exact string in file).\n"),
+                    "Write" | "write" => tool_guide.push_str("- write: {\"file_path\": \"<file_path>\", \"content\": \"<file content>\"} (Write file to filesystem).\n"),
                     _ => {
                         let props: Vec<String> = t
                             .input_schema
@@ -808,7 +545,33 @@ pub fn build_acp_prompt(req: &MessagesRequest) -> String {
                     }
                 }
             }
+            tool_guide.push_str("Note: Core execution tools must be lowercase: bash, read, edit, write, glob, grep.\n");
             sys_text.push_str(&tool_guide);
+        }
+    }
+
+    // 3. System Messages in req.messages (e.g. SessionStart hooks) folded into sys_text
+    for msg in &req.messages {
+        if msg.role == "system" {
+            let text = match &msg.content {
+                AnthropicContent::Text(t) => t.trim().to_string(),
+                AnthropicContent::Blocks(blocks) => {
+                    blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.trim().to_string()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                }
+            };
+            if !text.is_empty() {
+                if !sys_text.is_empty() {
+                    sys_text.push_str("\n\n");
+                }
+                sys_text.push_str(&text);
+            }
         }
     }
 
@@ -816,12 +579,15 @@ pub fn build_acp_prompt(req: &MessagesRequest) -> String {
         parts.push(format!("[System Instructions]\n{}", sys_text.trim()));
     }
 
-    // 3. Conversation Messages
+    // 4. Conversation Messages (User & Assistant)
     for msg in &req.messages {
+        if msg.role == "system" {
+            continue;
+        }
+
         let role_label = match msg.role.as_str() {
             "user" => "User",
             "assistant" => "Assistant",
-            "system" => "System",
             other => other,
         };
 
