@@ -29,6 +29,7 @@ pub fn build_settings_json(model: &str, port: u16, context_tokens: u32) -> Strin
             "CLAUDE_CODE_DISABLE_MODEL_ACCESS_FALLBACK": "1",
             "CLAUDE_CODE_NO_MODEL_FALLBACK": "1",
             "CLAUDE_CODE_MAX_CONTEXT_TOKENS": context_tokens.to_string(),
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": if context_tokens >= 1_000_000 { "50" } else { "80" },
             "API_TIMEOUT_MS": "600000",
             "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS": "600000",
             "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "600000",
@@ -90,6 +91,7 @@ pub fn launch_claude(model: &str, port: u16, extra_args: &[String]) -> anyhow::R
     cmd.env("CLAUDE_CODE_DISABLE_MODEL_ACCESS_FALLBACK", "1");
     cmd.env("CLAUDE_CODE_NO_MODEL_FALLBACK", "1");
     cmd.env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", ctx.to_string());
+    cmd.env("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", if ctx >= 1_000_000 { "50" } else { "80" });
     cmd.env("API_TIMEOUT_MS", "600000");
     cmd.env("CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS", "600000");
     cmd.env("CLAUDE_STREAM_IDLE_TIMEOUT_MS", "600000");
@@ -97,6 +99,9 @@ pub fn launch_claude(model: &str, port: u16, extra_args: &[String]) -> anyhow::R
 
     cmd.arg("--settings").arg(&settings);
     cmd.arg("--model").arg(&cli_model);
+    if !extra_args.iter().any(|a| a == "--autocompact") {
+        cmd.arg("--autocompact");
+    }
 
     let has_session_arg = extra_args.iter().any(|a| {
         a == "--session-id"

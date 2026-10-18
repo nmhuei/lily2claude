@@ -3,6 +3,166 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+/// Helper to convert python-style single-quoted dictionary or JSON to double quotes
+fn convert_single_to_double_quotes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+
+    for c in input.chars() {
+        if escape {
+            escape = false;
+            out.push(c);
+            continue;
+        }
+
+        if c == '\\' {
+            escape = true;
+            out.push(c);
+            continue;
+        }
+
+        if c == '"' && !in_single {
+            in_double = !in_double;
+            out.push(c);
+        } else if c == '\'' && !in_double {
+            in_single = !in_single;
+            out.push('"');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Robust scanner-based syntax repair for broken, escaped, or truncated JSON arguments
+fn repair_json_syntax(input: &str) -> Option<String> {
+    let mut text = input.trim().to_string();
+
+    // Normalize Python booleans and None
+    if text.contains("True") || text.contains("False") || text.contains("None") {
+        text = text
+            .replace(": True", ": true")
+            .replace(": False", ": false")
+            .replace(": None", ": null")
+            .replace(", True", ", true")
+            .replace(", False", ", false")
+            .replace(", None", ", null")
+            .replace("[True", "[true")
+            .replace("[False", "[false")
+            .replace("[None", "[null");
+    }
+
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut in_string = false;
+    let mut escape = false;
+    let mut bracket_stack: Vec<char> = Vec::new();
+
+    for c in text.chars() {
+        if in_string {
+            if escape {
+                escape = false;
+                match c {
+                    '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u' => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    '\'' => {
+                        // \' is invalid in JSON; replace with unescaped '
+                        out.push('\'');
+                    }
+                    'd' | 's' | 'w' | 'D' | 'S' | 'W' => {
+                        // Regex character class escape: in JSON string it needs an extra backslash
+                        out.push_str("\\\\");
+                        out.push(c);
+                    }
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+                out.push('"');
+            } else if c == '\n' {
+                out.push_str("\\n");
+            } else if c == '\r' {
+                out.push_str("\\r");
+            } else if c == '\t' {
+                out.push_str("\\t");
+            } else {
+                out.push(c);
+            }
+        } else {
+            // Outside of string
+            match c {
+                '"' => {
+                    in_string = true;
+                    out.push('"');
+                }
+                '{' => {
+                    bracket_stack.push('}');
+                    out.push('{');
+                }
+                '[' => {
+                    bracket_stack.push(']');
+                    out.push('[');
+                }
+                '}' => {
+                    while out.ends_with(' ') || out.ends_with('\t') || out.ends_with('\n') {
+                        out.pop();
+                    }
+                    if out.ends_with(',') {
+                        out.pop();
+                    }
+                    if bracket_stack.last() == Some(&'}') {
+                        bracket_stack.pop();
+                    }
+                    out.push('}');
+                }
+                ']' => {
+                    while out.ends_with(' ') || out.ends_with('\t') || out.ends_with('\n') {
+                        out.pop();
+                    }
+                    if out.ends_with(',') {
+                        out.pop();
+                    }
+                    if bracket_stack.last() == Some(&']') {
+                        bracket_stack.pop();
+                    }
+                    out.push(']');
+                }
+                _ => {
+                    out.push(c);
+                }
+            }
+        }
+    }
+
+    if escape {
+        out.push('\\');
+    }
+    if in_string {
+        out.push('"');
+    }
+
+    while out.ends_with(' ') || out.ends_with('\t') || out.ends_with('\n') {
+        out.pop();
+    }
+    if out.ends_with(',') {
+        out.pop();
+    }
+
+    while let Some(closing) = bracket_stack.pop() {
+        out.push(closing);
+    }
+
+    Some(out)
+}
+
 /// Self-repair common malformed JSON issues in tool call arguments
 pub fn repair_tool_arguments(raw: &str) -> String {
     let mut candidate = raw.trim().to_string();
@@ -21,41 +181,54 @@ pub fn repair_tool_arguments(raw: &str) -> String {
         return candidate;
     }
 
-    // Fix unclosed quote if truncated inside string
-    let quote_count = candidate.chars().filter(|c| *c == '"').count();
+    // Convert Python-like single-quoted dicts: {'key': 'val'}
+    let mut working = candidate.clone();
+    if (working.starts_with('{') || working.starts_with('['))
+        && working.contains('\'')
+        && !working.contains('"')
+    {
+        working = convert_single_to_double_quotes(&working);
+        if serde_json::from_str::<Value>(&working).is_ok() {
+            return working;
+        }
+    }
+
+    // Apply robust scanner for literal newlines, invalid escapes, and bracket balance
+    if let Some(repaired) = repair_json_syntax(&working) {
+        if serde_json::from_str::<Value>(&repaired).is_ok() {
+            return repaired;
+        }
+    }
+
+    // Secondary fallback: simple character balancing
+    let mut simple = candidate;
+    let quote_count = simple.chars().filter(|c| *c == '"').count();
     if quote_count % 2 == 1 {
-        candidate.push('"');
+        simple.push('"');
     }
-
-    // Fix trailing comma in objects
-    if candidate.contains(",}") {
-        candidate = candidate.replace(",}", "}");
+    if simple.contains(",}") {
+        simple = simple.replace(",}", "}");
     }
-    // Fix trailing comma in arrays
-    if candidate.contains(",]") {
-        candidate = candidate.replace(",]", "]");
+    if simple.contains(",]") {
+        simple = simple.replace(",]", "]");
     }
-
-    // Balance unclosed braces
-    let open_braces = candidate.chars().filter(|c| *c == '{').count();
-    let close_braces = candidate.chars().filter(|c| *c == '}').count();
+    let open_braces = simple.chars().filter(|c| *c == '{').count();
+    let close_braces = simple.chars().filter(|c| *c == '}').count();
     if open_braces > close_braces {
         for _ in 0..(open_braces - close_braces) {
-            candidate.push('}');
+            simple.push('}');
         }
     }
-
-    // Balance unclosed brackets
-    let open_brackets = candidate.chars().filter(|c| *c == '[').count();
-    let close_brackets = candidate.chars().filter(|c| *c == ']').count();
+    let open_brackets = simple.chars().filter(|c| *c == '[').count();
+    let close_brackets = simple.chars().filter(|c| *c == ']').count();
     if open_brackets > close_brackets {
         for _ in 0..(open_brackets - close_brackets) {
-            candidate.push(']');
+            simple.push(']');
         }
     }
 
-    if serde_json::from_str::<Value>(&candidate).is_ok() {
-        return candidate;
+    if serde_json::from_str::<Value>(&simple).is_ok() {
+        return simple;
     }
 
     raw.to_string()
@@ -79,26 +252,48 @@ static RE_FUNCTION_CALL: LazyLock<Regex> =
 static RE_PARAM: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?s)<parameter\s+name=["']([^"']+)["']\s*>(.*?)</parameter>"#).unwrap());
 
+static RE_ACTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?s)<action(?:\s+name=["']([^"']+)["'])?>\s*(.*?)\s*</action>"#).unwrap());
+
+static RE_DSML_TOOL_CALL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<[｜|]tool call begin[｜|]>(?:function)?<[｜|]tool sep[｜|]>([^\n]+)\s*\n(.*?)(?:<[｜|]tool call end[｜|]>|$)").unwrap()
+});
+
+static RE_JSON_FENCE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)```(?:json)?\s*\n\s*(\{[\s\S]*?\})\s*\n```").unwrap());
+
 static RE_BASH_FENCE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)```(?:bash|sh|shell|zsh)\s*\n([\s\S]*?)\n```").unwrap());
 
 pub struct ToolCallRepairEngine;
 
 impl ToolCallRepairEngine {
-    /// Strips any raw XML tool call tags or unclosed tool markers from text intended for user display.
+    /// Strips any raw XML/DSML tool call tags or unclosed tool markers from text intended for user display.
     pub fn clean_user_visible_text(raw: &str) -> String {
         let mut text = raw.to_string();
         text = RE_TOOL_CALL.replace_all(&text, "").to_string();
         text = RE_INVOKE.replace_all(&text, "").to_string();
         text = RE_FUNCTION_CALL.replace_all(&text, "").to_string();
+        text = RE_ACTION.replace_all(&text, "").to_string();
+        text = RE_DSML_TOOL_CALL.replace_all(&text, "").to_string();
+
+        // Strip DSML boundary tags
+        text = text
+            .replace("<｜tool calls begin｜>", "")
+            .replace("<｜tool calls end｜>", "")
+            .replace("<|tool calls begin|>", "")
+            .replace("<|tool calls end|>", "");
 
         // Only strip unclosed opening tags if there is no closing tag
-        for tag in ["<tool_call", "<invoke", "<function_call"] {
+        for tag in ["<tool_call", "<invoke", "<function_call", "<action", "<｜tool", "<|tool"] {
             if let Some(pos) = text.rfind(tag) {
                 let close_tag = match tag {
                     "<tool_call" => "</tool_call>",
                     "<invoke" => "</invoke>",
                     "<function_call" => "</function_call>",
+                    "<action" => "</action>",
+                    "<｜tool" => "<｜tool call end｜>",
+                    "<|tool" => "<|tool call end|>",
                     _ => "",
                 };
                 if !close_tag.is_empty() && !text[pos..].contains(close_tag) {
@@ -110,6 +305,7 @@ impl ToolCallRepairEngine {
         text.replace("</tool_call>", "")
             .replace("</invoke>", "")
             .replace("</function_call>", "")
+            .replace("</action>", "")
             .trim()
             .to_string()
     }
@@ -121,6 +317,8 @@ impl ToolCallRepairEngine {
             "<invoke",
             "<tool>",
             "<action",
+            "<｜tool",
+            "<|tool",
             "```bash",
             "```sh",
             "```shell",
@@ -145,6 +343,8 @@ impl ToolCallRepairEngine {
             "<function_call", "<function_cal", "<function_ca", "<function_c", "<function_", "<function", "<functio", "<functi", "<funct", "<func", "<fun", "<fu", "<f",
             "<invoke", "<invok", "<invo", "<inv", "<in", "<i",
             "<action", "<actio", "<acti", "<act", "<ac", "<a",
+            "<｜tool", "<｜too", "<｜to", "<｜t", "<｜",
+            "<|tool", "<|too", "<|to",
             "```bash", "```bas", "```ba", "```b",
             "```shell", "```shel", "```she", "```sh", "```s",
             "```zsh", "```zs", "```z",
@@ -490,6 +690,38 @@ impl ToolCallRepairEngine {
 
                 // Strictly retain only valid Claude Code Write parameters: file_path, content
                 obj.retain(|k, _| k == "file_path" || k == "content");
+            } else if lower_target == "glob" || lower_target == "globtool" {
+                if let Some(pat) = obj.remove("file_pattern")
+                    .or_else(|| obj.remove("glob"))
+                    .or_else(|| obj.remove("query"))
+                    .or_else(|| obj.remove("search")) {
+                    if !obj.contains_key("pattern") {
+                        obj.insert("pattern".to_string(), pat);
+                    }
+                }
+                if let Some(p) = obj.remove("directory")
+                    .or_else(|| obj.remove("dir")) {
+                    if !obj.contains_key("path") {
+                        obj.insert("path".to_string(), p);
+                    }
+                }
+                obj.retain(|k, _| k == "pattern" || k == "path");
+            } else if lower_target == "grep" || lower_target == "greptool" {
+                if let Some(pat) = obj.remove("regex")
+                    .or_else(|| obj.remove("search"))
+                    .or_else(|| obj.remove("query"))
+                    .or_else(|| obj.remove("term")) {
+                    if !obj.contains_key("pattern") {
+                        obj.insert("pattern".to_string(), pat);
+                    }
+                }
+                if let Some(p) = obj.remove("directory")
+                    .or_else(|| obj.remove("dir")) {
+                    if !obj.contains_key("path") {
+                        obj.insert("path".to_string(), p);
+                    }
+                }
+                obj.retain(|k, _| k == "pattern" || k == "path" || k == "glob" || k == "case_sensitive");
             } else if lower_target == "websearch" {
                 if let Some(q) = obj.remove("q")
                     .or_else(|| obj.remove("search_query"))
@@ -604,6 +836,16 @@ impl ToolCallRepairEngine {
             let has_old = norm_args.get("old_string").and_then(|v| v.as_str()).is_some();
             let has_new = norm_args.get("new_string").and_then(|v| v.as_str()).is_some();
             if !has_path || !has_old || !has_new {
+                return None;
+            }
+        } else if lower == "glob" || lower == "globtool" {
+            let has_pat = norm_args.get("pattern").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
+            if !has_pat {
+                return None;
+            }
+        } else if lower == "grep" || lower == "greptool" {
+            let has_pat = norm_args.get("pattern").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
+            if !has_pat {
                 return None;
             }
         } else if lower == "skill" {
@@ -759,7 +1001,127 @@ impl ToolCallRepairEngine {
             return results;
         }
 
-        // 4. Detect markdown bash / sh blocks IF AND ONLY IF "bash" is declared by Claude Code
+        // 4. Detect <action name="..."> ... </action>
+        for cap in RE_ACTION.captures_iter(text) {
+            let body = &cap[2];
+            let repaired_body = repair_tool_arguments(body);
+            if let Ok(val) = serde_json::from_str::<Value>(&repaired_body) {
+                let raw_name = cap
+                    .get(1)
+                    .map(|m| m.as_str())
+                    .or_else(|| val.get("name").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                if !raw_name.is_empty() {
+                    let mapped_name = Self::map_tool_name(raw_name, casing_map);
+                    let mut args_val = val
+                        .get("arguments")
+                        .or_else(|| val.get("parameters"))
+                        .cloned()
+                        .unwrap_or(val.clone());
+                    if let Some(s) = args_val.as_str() {
+                        let rep_s = repair_tool_arguments(s);
+                        if let Ok(inner) = serde_json::from_str::<Value>(&rep_s) {
+                            args_val = inner;
+                        }
+                    }
+                    let norm_args = Self::normalize_arguments_with_raw(&mapped_name, raw_name, args_val);
+                    if let Some(call) = Self::sanitize_and_validate(mapped_name, norm_args, casing_map) {
+                        results.push(call);
+                    }
+                }
+            }
+        }
+
+        if !results.is_empty() {
+            return results;
+        }
+
+        // 5. Detect DSML tool calls (<｜tool call begin｜>...)
+        for cap in RE_DSML_TOOL_CALL.captures_iter(text) {
+            let raw_name = cap[1].trim();
+            let body = cap[2].trim();
+            let repaired_body = repair_tool_arguments(body);
+            if let Ok(val) = serde_json::from_str::<Value>(&repaired_body) {
+                let mapped_name = Self::map_tool_name(raw_name, casing_map);
+                let mut args_val = val
+                    .get("arguments")
+                    .or_else(|| val.get("parameters"))
+                    .cloned()
+                    .unwrap_or(val.clone());
+                if let Some(s) = args_val.as_str() {
+                    let rep_s = repair_tool_arguments(s);
+                    if let Ok(inner) = serde_json::from_str::<Value>(&rep_s) {
+                        args_val = inner;
+                    }
+                }
+                let norm_args = Self::normalize_arguments_with_raw(&mapped_name, raw_name, args_val);
+                if let Some(call) = Self::sanitize_and_validate(mapped_name, norm_args, casing_map) {
+                    results.push(call);
+                }
+            }
+        }
+
+        if !results.is_empty() {
+            return results;
+        }
+
+        // 6. Detect ```json code fences containing tool call JSON
+        for cap in RE_JSON_FENCE.captures_iter(text) {
+            let raw_json = &cap[1];
+            let repaired_json = repair_tool_arguments(raw_json);
+            if let Ok(val) = serde_json::from_str::<Value>(&repaired_json) {
+                if let Some(obj) = val.as_object() {
+                    let raw_name = obj
+                        .get("name")
+                        .or_else(|| obj.get("tool"))
+                        .or_else(|| obj.get("tool_name"))
+                        .or_else(|| obj.get("action"))
+                        .and_then(|v| v.as_str());
+
+                    if let Some(raw_name) = raw_name {
+                        let mapped_name = Self::map_tool_name(raw_name, casing_map);
+                        let mut args_val = obj
+                            .get("arguments")
+                            .or_else(|| obj.get("parameters"))
+                            .or_else(|| obj.get("args"))
+                            .or_else(|| obj.get("action_input"))
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                let mut copy = obj.clone();
+                                copy.remove("name");
+                                copy.remove("tool");
+                                copy.remove("tool_name");
+                                copy.remove("action");
+                                Value::Object(copy)
+                            });
+
+                        if let Some(s) = args_val.as_str() {
+                            let rep_s = repair_tool_arguments(s);
+                            if let Ok(inner) = serde_json::from_str::<Value>(&rep_s) {
+                                args_val = inner;
+                            }
+                        }
+
+                        let norm_args = Self::normalize_arguments_with_raw(&mapped_name, raw_name, args_val);
+                        if let Some(call) = Self::sanitize_and_validate(mapped_name, norm_args, casing_map) {
+                            results.push(call);
+                        }
+                    } else if obj.contains_key("command") && casing_map.contains_key("bash") {
+                        let mapped_name = casing_map.get("bash").cloned().unwrap_or_else(|| "Bash".to_string());
+                        let norm_args = Self::normalize_arguments_with_raw(&mapped_name, "bash", val.clone());
+                        if let Some(call) = Self::sanitize_and_validate(mapped_name, norm_args, casing_map) {
+                            results.push(call);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !results.is_empty() {
+            return results;
+        }
+
+        // 7. Detect markdown bash / sh blocks IF AND ONLY IF "bash" is declared by Claude Code
         if let Some(bash_name) = casing_map.get("bash") {
             for cap in RE_BASH_FENCE.captures_iter(text) {
                 let cmd = cap[1].trim();
@@ -782,7 +1144,15 @@ impl ToolCallRepairEngine {
         let stripped = RE_TOOL_CALL.replace_all(text, "");
         let stripped = RE_INVOKE.replace_all(&stripped, "");
         let stripped = RE_FUNCTION_CALL.replace_all(&stripped, "");
-        stripped.trim().to_string()
+        let stripped = RE_ACTION.replace_all(&stripped, "");
+        let stripped = RE_DSML_TOOL_CALL.replace_all(&stripped, "");
+        stripped
+            .replace("<｜tool calls begin｜>", "")
+            .replace("<｜tool calls end｜>", "")
+            .replace("<|tool calls begin|>", "")
+            .replace("<|tool calls end|>", "")
+            .trim()
+            .to_string()
     }
 }
 
@@ -883,5 +1253,96 @@ mod tests {
         assert!(cleaned.contains("1. Chuẩn hóa README"));
         assert!(!cleaned.contains("<tool_call>"));
         assert!(!cleaned.contains("</tool_call>"));
+    }
+
+    #[test]
+    fn test_repair_tool_arguments_unescaped_newlines() {
+        let raw = "{\"command\": \"cat << 'EOF' > file.txt\nhello world\nEOF\"}";
+        let repaired = repair_tool_arguments(raw);
+        let val: Value = serde_json::from_str(&repaired).expect("Should parse");
+        assert_eq!(
+            val["command"],
+            "cat << 'EOF' > file.txt\nhello world\nEOF"
+        );
+    }
+
+    #[test]
+    fn test_repair_tool_arguments_python_dict() {
+        let raw = "{'command': 'git status', 'replace_all': True}";
+        let repaired = repair_tool_arguments(raw);
+        let val: Value = serde_json::from_str(&repaired).expect("Should parse");
+        assert_eq!(val["command"], "git status");
+        assert_eq!(val["replace_all"], true);
+    }
+
+    #[test]
+    fn test_repair_tool_arguments_invalid_escape() {
+        let raw = r#"{"command": "grep -P '\d+' file.txt"}"#;
+        let repaired = repair_tool_arguments(raw);
+        let val: Value = serde_json::from_str(&repaired).expect("Should parse");
+        assert_eq!(val["command"], r#"grep -P '\d+' file.txt"#);
+    }
+
+    #[test]
+    fn test_extract_action_tag() {
+        let mut map = HashMap::new();
+        map.insert("bash".to_string(), "Bash".to_string());
+
+        let text = r#"<action name="Bash">
+{"command": "cargo build"}
+</action>"#;
+        let calls = ToolCallRepairEngine::detect_and_extract(text, &map);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].arguments["command"], "cargo build");
+    }
+
+    #[test]
+    fn test_extract_dsml_tool_call() {
+        let mut map = HashMap::new();
+        map.insert("bash".to_string(), "Bash".to_string());
+
+        let text = "<｜tool calls begin｜><｜tool call begin｜>function<｜tool sep｜>bash\n{\"command\": \"cargo check\"}<｜tool call end｜><｜tool calls end｜>";
+        let calls = ToolCallRepairEngine::detect_and_extract(text, &map);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].arguments["command"], "cargo check");
+    }
+
+    #[test]
+    fn test_extract_json_fence_tool_call() {
+        let mut map = HashMap::new();
+        map.insert("bash".to_string(), "Bash".to_string());
+
+        let text = "Here is the command to run:\n```json\n{\n  \"tool\": \"bash\",\n  \"command\": \"npm test\"\n}\n```";
+        let calls = ToolCallRepairEngine::detect_and_extract(text, &map);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].arguments["command"], "npm test");
+    }
+
+    #[test]
+    fn test_glob_and_grep_normalization() {
+        let mut map = HashMap::new();
+        map.insert("glob".to_string(), "Glob".to_string());
+        map.insert("grep".to_string(), "Grep".to_string());
+
+        let glob_text = r#"<tool_call>
+{"name": "glob", "arguments": {"glob": "**/*.rs", "directory": "src"}}
+</tool_call>"#;
+        let calls = ToolCallRepairEngine::detect_and_extract(glob_text, &map);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Glob");
+        assert_eq!(calls[0].arguments["pattern"], "**/*.rs");
+        assert_eq!(calls[0].arguments["path"], "src");
+
+        let grep_text = r#"<tool_call>
+{"name": "grep", "arguments": {"regex": "fn test", "dir": "tests"}}
+</tool_call>"#;
+        let calls = ToolCallRepairEngine::detect_and_extract(grep_text, &map);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Grep");
+        assert_eq!(calls[0].arguments["pattern"], "fn test");
+        assert_eq!(calls[0].arguments["path"], "tests");
     }
 }

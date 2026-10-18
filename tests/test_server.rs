@@ -90,3 +90,63 @@ fn test_get_streamable_text_end_filters_tool_tags() {
     let s4 = "<tool_call>\n{\"name\": \"Bash\"}\n</tool_call>";
     assert_eq!(get_streamable_text_end(s4), 0);
 }
+
+#[test]
+fn test_build_acp_prompt_compaction_truncates_and_injects_directive() {
+    let huge_output = "a".repeat(1000);
+    let req = MessagesRequest {
+        model: "deepseek".to_string(),
+        system: Some(SystemPrompt::Single("You are Claude.".to_string())),
+        tools: Some(vec![AnthropicTool {
+            name: "Bash".to_string(),
+            description: Some("Execute command".to_string()),
+            input_schema: json!({}),
+        }]),
+        stream: true,
+        max_tokens: 4096,
+        temperature: None,
+        messages: vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Text("Read logs".to_string()),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: AnthropicContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "call_log".to_string(),
+                    name: "Bash".to_string(),
+                    input: json!({"command": "cat /var/log/syslog"}),
+                }]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_log".to_string(),
+                    content: json!(huge_output),
+                    is_error: Some(false),
+                }]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Text(
+                    "REMINDER: Do NOT call any tools. Respond with plain text only — <summary>Primary Request and Intent: ...</summary>".to_string(),
+                ),
+            },
+        ],
+    };
+
+    assert!(req.is_compaction_request());
+    let prompt = build_acp_prompt(&req);
+
+    // 1. [Tools Instruction] MUST NOT be present
+    assert!(!prompt.contains("[Tools Instruction]"));
+
+    // 2. Huge tool result MUST be truncated
+    assert!(prompt.contains("[Output truncated: 1000 chars]"));
+    assert!(!prompt.contains(&huge_output));
+
+    // 3. [COMPACTION DIRECTIVE] MUST be injected
+    assert!(prompt.contains("[COMPACTION DIRECTIVE]"));
+    assert!(prompt.contains("Produce ONLY the concise summary enclosed within <summary>...</summary> tags."));
+}
+

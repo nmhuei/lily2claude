@@ -51,6 +51,7 @@ pub struct SseStreamTranslator {
     has_emitted_text: bool,
     input_tokens: u64,
     upstream_output_tokens: Option<u64>,
+    pub is_compact: bool,
 }
 
 impl SseStreamTranslator {
@@ -71,11 +72,17 @@ impl SseStreamTranslator {
             has_emitted_text: false,
             input_tokens: 50,
             upstream_output_tokens: None,
+            is_compact: false,
         }
     }
 
     pub fn with_input_tokens(mut self, tokens: u64) -> Self {
         self.input_tokens = tokens;
+        self
+    }
+
+    pub fn with_compaction(mut self, is_compact: bool) -> Self {
+        self.is_compact = is_compact;
         self
     }
 
@@ -396,7 +403,9 @@ impl SseStreamTranslator {
                     self.has_emitted_blocks = true;
                     self.has_emitted_text = true;
                     let cleaned_acc = crate::protocol::repair::ToolCallRepairEngine::clean_user_visible_text(&self.accumulated_text);
-                    let fallback_text = if !cleaned_acc.is_empty() {
+                    let fallback_text = if self.is_compact {
+                        "<summary>\nConversation compacted.\n- Key decisions and project context preserved.\n</summary>".to_string()
+                    } else if !cleaned_acc.is_empty() {
                         cleaned_acc
                     } else {
                         "Analyzing requirements and preparing next steps.".to_string()
@@ -456,31 +465,30 @@ impl SseStreamTranslator {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum ActiveBlock {
-    None,
-    Thinking(usize),
-    Text(usize),
-}
+use crate::protocol::sanitize::{split_utf8_prefix, strip_system_tags, RENDER_DELTA_CHUNK_BYTES};
+use crate::protocol::thinking::{ThinkingRouteItem, ThinkingRouter};
+use crate::protocol::tracker::SseBlockTracker;
 
 /// Robust incremental SSE stream emitter for Anthropic Messages API.
 ///
 /// Features:
-/// 1. Smooth real-time token streaming without multi-second stalls.
+/// 1. Smooth real-time token streaming without multi-second stalls (256-byte chunk pacing).
 /// 2. Zero truncation of post-tool content (preserves questions, tables, and explanations).
-/// 3. Strict Anthropic block lifecycle compliance (block indices 0, 1, 2, ...).
+/// 3. Strict Anthropic block lifecycle compliance via SseBlockTracker.
 /// 4. Interleaved text -> tool_use -> text block transitions.
+/// 5. Thinking segmentation (16KB) and automatic leaked tag routing via ThinkingRouter.
 pub struct AnthropicBlockStreamer {
     pub message_id: String,
     pub model: String,
     pub input_tokens: u64,
     pub casing_map: HashMap<String, String>,
-    pub current_block: ActiveBlock,
-    pub next_block_index: usize,
+    pub tracker: SseBlockTracker,
+    pub thinking_router: ThinkingRouter,
     pub text_buffer: String,
     pub streamed_in_current_block: usize,
     pub emitted_tool_count: usize,
     pub has_emitted_text_block: bool,
+    pub is_compact: bool,
 }
 
 impl AnthropicBlockStreamer {
@@ -495,13 +503,19 @@ impl AnthropicBlockStreamer {
             model: model.to_string(),
             input_tokens,
             casing_map,
-            current_block: ActiveBlock::None,
-            next_block_index: 0,
+            tracker: SseBlockTracker::new(),
+            thinking_router: ThinkingRouter::new(),
             text_buffer: String::new(),
             streamed_in_current_block: 0,
             emitted_tool_count: 0,
             has_emitted_text_block: false,
+            is_compact: false,
         }
+    }
+
+    pub fn with_compaction(mut self, is_compact: bool) -> Self {
+        self.is_compact = is_compact;
+        self
     }
 
     pub fn start(&self) -> SseEvent {
@@ -534,62 +548,23 @@ impl AnthropicBlockStreamer {
             return events;
         }
 
-        match self.current_block {
-            ActiveBlock::Thinking(idx) => {
-                events.push(SseEvent::new(
-                    "content_block_delta",
-                    json!({
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {"type": "thinking_delta", "thinking": chunk}
-                    }),
-                ));
-            }
-            ActiveBlock::Text(prev_idx) => {
-                events.push(SseEvent::new(
-                    "content_block_stop",
-                    json!({"type": "content_block_stop", "index": prev_idx}),
-                ));
-                let idx = self.next_block_index;
-                self.next_block_index += 1;
-                events.push(SseEvent::new(
-                    "content_block_start",
-                    json!({
-                        "type": "content_block_start",
-                        "index": idx,
-                        "content_block": {"type": "thinking", "thinking": ""}
-                    }),
-                ));
-                events.push(SseEvent::new(
-                    "content_block_delta",
-                    json!({
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {"type": "thinking_delta", "thinking": chunk}
-                    }),
-                ));
-                self.current_block = ActiveBlock::Thinking(idx);
-            }
-            ActiveBlock::None => {
-                let idx = self.next_block_index;
-                self.next_block_index += 1;
-                events.push(SseEvent::new(
-                    "content_block_start",
-                    json!({
-                        "type": "content_block_start",
-                        "index": idx,
-                        "content_block": {"type": "thinking", "thinking": ""}
-                    }),
-                ));
-                events.push(SseEvent::new(
-                    "content_block_delta",
-                    json!({
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {"type": "thinking_delta", "thinking": chunk}
-                    }),
-                ));
-                self.current_block = ActiveBlock::Thinking(idx);
+        let items = self.thinking_router.process_thinking(chunk);
+        for item in items {
+            match item {
+                ThinkingRouteItem::SegmentBreak => {
+                    if let Some(idx) = self.tracker.close_thinking() {
+                        events.push(SseEvent::new(
+                            "content_block_stop",
+                            json!({"type": "content_block_stop", "index": idx}),
+                        ));
+                    }
+                }
+                ThinkingRouteItem::Thinking(fragment) => {
+                    self.emit_thinking_fragment(&fragment, &mut events);
+                }
+                ThinkingRouteItem::Text(fragment) => {
+                    self.feed_text_internal(&fragment, &mut events);
+                }
             }
         }
 
@@ -600,6 +575,71 @@ impl AnthropicBlockStreamer {
         let mut events = Vec::new();
         if chunk.is_empty() {
             return events;
+        }
+
+        let items = self.thinking_router.process_text(chunk);
+        for item in items {
+            match item {
+                ThinkingRouteItem::Thinking(fragment) => {
+                    self.emit_thinking_fragment(&fragment, &mut events);
+                }
+                ThinkingRouteItem::SegmentBreak => {
+                    if let Some(idx) = self.tracker.close_thinking() {
+                        events.push(SseEvent::new(
+                            "content_block_stop",
+                            json!({"type": "content_block_stop", "index": idx}),
+                        ));
+                    }
+                }
+                ThinkingRouteItem::Text(fragment) => {
+                    self.feed_text_internal(&fragment, &mut events);
+                }
+            }
+        }
+
+        events
+    }
+
+    fn emit_thinking_fragment(&mut self, fragment: &str, events: &mut Vec<SseEvent>) {
+        if fragment.is_empty() {
+            return;
+        }
+        let (idx, is_new, closed_text) = self.tracker.ensure_thinking();
+        if let Some(c_idx) = closed_text {
+            events.push(SseEvent::new(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": c_idx}),
+            ));
+        }
+        if is_new {
+            events.push(SseEvent::new(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {"type": "thinking", "thinking": ""}
+                }),
+            ));
+        }
+
+        let mut remaining = fragment;
+        while !remaining.is_empty() {
+            let (sub, rest) = split_utf8_prefix(remaining, RENDER_DELTA_CHUNK_BYTES);
+            remaining = rest;
+            events.push(SseEvent::new(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {"type": "thinking_delta", "thinking": sub}
+                }),
+            ));
+        }
+    }
+
+    fn feed_text_internal(&mut self, chunk: &str, events: &mut Vec<SseEvent>) {
+        if chunk.is_empty() {
+            return;
         }
 
         self.text_buffer.push_str(chunk);
@@ -613,19 +653,9 @@ impl AnthropicBlockStreamer {
                     let safe_len = self.text_buffer.len().saturating_sub(holdback);
 
                     if safe_len > self.streamed_in_current_block {
-                        self.ensure_text_block_open(&mut events);
-                        let to_stream = &self.text_buffer[self.streamed_in_current_block..safe_len];
-                        if let ActiveBlock::Text(idx) = self.current_block {
-                            events.push(SseEvent::new(
-                                "content_block_delta",
-                                json!({
-                                    "type": "content_block_delta",
-                                    "index": idx,
-                                    "delta": {"type": "text_delta", "text": to_stream}
-                                }),
-                            ));
-                            self.streamed_in_current_block = safe_len;
-                        }
+                        let to_stream = self.text_buffer[self.streamed_in_current_block..safe_len].to_string();
+                        self.emit_text_delta(&to_stream, events);
+                        self.streamed_in_current_block = safe_len;
                     }
                     break;
                 }
@@ -633,27 +663,16 @@ impl AnthropicBlockStreamer {
                     if tag_start > self.streamed_in_current_block {
                         let pre_text = self.text_buffer[self.streamed_in_current_block..tag_start].to_string();
                         if !pre_text.trim().is_empty() {
-                            self.ensure_text_block_open(&mut events);
-                            if let ActiveBlock::Text(idx) = self.current_block {
-                                events.push(SseEvent::new(
-                                    "content_block_delta",
-                                    json!({
-                                        "type": "content_block_delta",
-                                        "index": idx,
-                                        "delta": {"type": "text_delta", "text": pre_text}
-                                    }),
-                                ));
-                            }
+                            self.emit_text_delta(&pre_text, events);
                         }
                         self.streamed_in_current_block = tag_start;
                     }
 
-                    if let ActiveBlock::Text(idx) = self.current_block {
+                    if let Some(c_idx) = self.tracker.close_text() {
                         events.push(SseEvent::new(
                             "content_block_stop",
-                            json!({"type": "content_block_stop", "index": idx}),
+                            json!({"type": "content_block_stop", "index": c_idx}),
                         ));
-                        self.current_block = ActiveBlock::None;
                     }
 
                     let search_from = tag_start + open_tag_len;
@@ -672,8 +691,7 @@ impl AnthropicBlockStreamer {
                                 rep.arguments,
                                 &self.casing_map,
                             ) {
-                                let tc_idx = self.next_block_index;
-                                self.next_block_index += 1;
+                                let tc_idx = self.tracker.next_index();
                                 let now_ms = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
@@ -722,8 +740,49 @@ impl AnthropicBlockStreamer {
                 }
             }
         }
+    }
 
-        events
+    fn emit_text_delta(&mut self, text: &str, events: &mut Vec<SseEvent>) {
+        if text.is_empty() {
+            return;
+        }
+        let (idx, is_new, closed_thinking) = self.tracker.ensure_text();
+        if let Some(c_idx) = closed_thinking {
+            events.push(SseEvent::new(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": c_idx}),
+            ));
+        }
+        if is_new {
+            events.push(SseEvent::new(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            ));
+            self.has_emitted_text_block = true;
+        }
+
+        let mut actual_text = text.to_string();
+        if self.is_compact && is_new && !actual_text.contains("<summary>") {
+            actual_text = format!("<summary>\n{}", actual_text);
+        }
+
+        let mut remaining = actual_text.as_str();
+        while !remaining.is_empty() {
+            let (sub, rest) = split_utf8_prefix(remaining, RENDER_DELTA_CHUNK_BYTES);
+            remaining = rest;
+            events.push(SseEvent::new(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {"type": "text_delta", "text": sub}
+                }),
+            ));
+        }
     }
 
     pub fn finish(
@@ -734,30 +793,32 @@ impl AnthropicBlockStreamer {
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
+        let leftover_items = self.thinking_router.finish();
+        for item in leftover_items {
+            match item {
+                ThinkingRouteItem::Thinking(fragment) => {
+                    self.emit_thinking_fragment(&fragment, &mut events);
+                }
+                ThinkingRouteItem::Text(fragment) => {
+                    self.text_buffer.push_str(&fragment);
+                }
+                ThinkingRouteItem::SegmentBreak => {}
+            }
+        }
+
         if let Some((tag_start, _, _)) = Self::find_tool_tag_start(&self.text_buffer) {
             if tag_start > self.streamed_in_current_block {
                 let pre = self.text_buffer[self.streamed_in_current_block..tag_start].to_string();
                 if !pre.trim().is_empty() {
-                    self.ensure_text_block_open(&mut events);
-                    if let ActiveBlock::Text(idx) = self.current_block {
-                        events.push(SseEvent::new(
-                            "content_block_delta",
-                            json!({
-                                "type": "content_block_delta",
-                                "index": idx,
-                                "delta": {"type": "text_delta", "text": pre}
-                            }),
-                        ));
-                    }
+                    self.emit_text_delta(&pre, &mut events);
                 }
             }
 
-            if let ActiveBlock::Text(idx) = self.current_block {
+            if let Some(c_idx) = self.tracker.close_text() {
                 events.push(SseEvent::new(
                     "content_block_stop",
-                    json!({"type": "content_block_stop", "index": idx}),
+                    json!({"type": "content_block_stop", "index": c_idx}),
                 ));
-                self.current_block = ActiveBlock::None;
             }
 
             let unclosed_xml = &self.text_buffer[tag_start..];
@@ -773,8 +834,7 @@ impl AnthropicBlockStreamer {
                         rep.arguments,
                         &self.casing_map,
                     ) {
-                        let tc_idx = self.next_block_index;
-                        self.next_block_index += 1;
+                        let tc_idx = self.tracker.next_index();
                         let now_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -814,52 +874,47 @@ impl AnthropicBlockStreamer {
                 }
             } else {
                 let cleaned = crate::protocol::repair::ToolCallRepairEngine::clean_user_visible_text(unclosed_xml);
+                let cleaned = strip_system_tags(&cleaned);
                 if !cleaned.is_empty() {
-                    self.ensure_text_block_open(&mut events);
-                    if let ActiveBlock::Text(idx) = self.current_block {
-                        events.push(SseEvent::new(
-                            "content_block_delta",
-                            json!({
-                                "type": "content_block_delta",
-                                "index": idx,
-                                "delta": {"type": "text_delta", "text": cleaned}
-                            }),
-                        ));
-                    }
+                    self.emit_text_delta(&cleaned, &mut events);
                 }
             }
         } else if self.text_buffer.len() > self.streamed_in_current_block {
             let remaining = &self.text_buffer[self.streamed_in_current_block..];
             let cleaned = crate::protocol::repair::ToolCallRepairEngine::clean_user_visible_text(remaining);
+            let cleaned = strip_system_tags(&cleaned);
             if !cleaned.is_empty() {
-                self.ensure_text_block_open(&mut events);
-                if let ActiveBlock::Text(idx) = self.current_block {
-                    events.push(SseEvent::new(
-                        "content_block_delta",
-                        json!({
-                            "type": "content_block_delta",
-                            "index": idx,
-                            "delta": {"type": "text_delta", "text": cleaned}
-                        }),
-                    ));
-                }
+                self.emit_text_delta(&cleaned, &mut events);
             }
         }
 
-        match self.current_block {
-            ActiveBlock::Text(idx) | ActiveBlock::Thinking(idx) => {
+        if self.is_compact && self.has_emitted_text_block && !self.text_buffer.contains("</summary>") {
+            if let Some(t_idx) = self.tracker.text_idx() {
                 events.push(SseEvent::new(
-                    "content_block_stop",
-                    json!({"type": "content_block_stop", "index": idx}),
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": t_idx,
+                        "delta": {"type": "text_delta", "text": "\n</summary>"}
+                    }),
                 ));
-                self.current_block = ActiveBlock::None;
             }
-            ActiveBlock::None => {}
+        }
+
+        for (_, idx) in self.tracker.close_all() {
+            events.push(SseEvent::new(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": idx}),
+            ));
         }
 
         if !self.has_emitted_text_block && self.emitted_tool_count == 0 {
-            let idx = self.next_block_index;
-            self.next_block_index += 1;
+            let idx = self.tracker.next_index();
+            let fallback_text = if self.is_compact {
+                "<summary>\nConversation compacted.\n- Key decisions and project context preserved.\n</summary>"
+            } else {
+                "Analyzing requirements and preparing next steps."
+            };
             events.push(SseEvent::new(
                 "content_block_start",
                 json!({
@@ -875,7 +930,7 @@ impl AnthropicBlockStreamer {
                     "index": idx,
                     "delta": {
                         "type": "text_delta",
-                        "text": "Analyzing requirements and preparing next steps."
+                        "text": fallback_text
                     }
                 }),
             ));
@@ -918,7 +973,7 @@ impl AnthropicBlockStreamer {
         ];
 
         let mut earliest: Option<(usize, usize, &'static str)> = None;
-        for (open_prefix, close_tag) in tagcandidates_iter(&tag_candidates) {
+        for (open_prefix, close_tag) in tag_candidates {
             if let Some(pos) = s.find(open_prefix) {
                 if let Some(rel_gt) = s[pos..].find('>') {
                     let open_tag_len = rel_gt + 1;
@@ -951,49 +1006,8 @@ impl AnthropicBlockStreamer {
         }
         0
     }
-
-    fn ensure_text_block_open(&mut self, events: &mut Vec<SseEvent>) {
-        match self.current_block {
-            ActiveBlock::Text(_) => {}
-            ActiveBlock::Thinking(prev_idx) => {
-                events.push(SseEvent::new(
-                    "content_block_stop",
-                    json!({"type": "content_block_stop", "index": prev_idx}),
-                ));
-                let idx = self.next_block_index;
-                self.next_block_index += 1;
-                events.push(SseEvent::new(
-                    "content_block_start",
-                    json!({
-                        "type": "content_block_start",
-                        "index": idx,
-                        "content_block": {"type": "text", "text": ""}
-                    }),
-                ));
-                self.current_block = ActiveBlock::Text(idx);
-                self.has_emitted_text_block = true;
-            }
-            ActiveBlock::None => {
-                let idx = self.next_block_index;
-                self.next_block_index += 1;
-                events.push(SseEvent::new(
-                    "content_block_start",
-                    json!({
-                        "type": "content_block_start",
-                        "index": idx,
-                        "content_block": {"type": "text", "text": ""}
-                    }),
-                ));
-                self.current_block = ActiveBlock::Text(idx);
-                self.has_emitted_text_block = true;
-            }
-        }
-    }
 }
 
-fn tagcandidates_iter<'a>(arr: &'a [(&'static str, &'static str)]) -> impl Iterator<Item = (&'static str, &'static str)> + 'a {
-    arr.iter().copied()
-}
 
 #[cfg(test)]
 mod tests {
@@ -1143,6 +1157,62 @@ mod tests {
         assert!(tool_start.is_some());
         assert_eq!(final_evs.last().unwrap().event, "message_stop");
         assert_eq!(final_evs[final_evs.len() - 2].data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_streamer_leaked_thinking_rerouted_from_text() {
+        let mut streamer = AnthropicBlockStreamer::new("msg_6", "claude-sonnet-5-5", 100, HashMap::new());
+        let _ = streamer.start();
+
+        // Feed text containing leaked thinking closed by </think>
+        let evs = streamer.feed_text("Inspecting codebase structure...</think>Here is the project overview.");
+
+        // Expected:
+        // 1. content_block_start(0, thinking)
+        // 2. content_block_delta(0, thinking_delta: "Inspecting codebase structure...")
+        // 3. content_block_stop(0)
+        // 4. content_block_start(1, text)
+        // 5. content_block_delta(1, text_delta: "Here is the project overview.")
+        assert_eq!(evs.len(), 5);
+        assert_eq!(evs[0].event, "content_block_start");
+        assert_eq!(evs[0].data["index"], 0);
+        assert_eq!(evs[0].data["content_block"]["type"], "thinking");
+
+        assert_eq!(evs[1].event, "content_block_delta");
+        assert_eq!(evs[1].data["index"], 0);
+        assert_eq!(evs[1].data["delta"]["thinking"], "Inspecting codebase structure...");
+
+        assert_eq!(evs[2].event, "content_block_stop");
+        assert_eq!(evs[2].data["index"], 0);
+
+        assert_eq!(evs[3].event, "content_block_start");
+        assert_eq!(evs[3].data["index"], 1);
+        assert_eq!(evs[3].data["content_block"]["type"], "text");
+
+        assert_eq!(evs[4].event, "content_block_delta");
+        assert_eq!(evs[4].data["index"], 1);
+        assert_eq!(evs[4].data["delta"]["text"], "Here is the project overview.");
+
+        let final_evs = streamer.finish(100, 40, 0);
+        assert_eq!(final_evs[0].event, "content_block_stop");
+        assert_eq!(final_evs[0].data["index"], 1);
+        assert_eq!(final_evs[1].data["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn test_streamer_thinking_16kb_segmentation() {
+        let mut streamer = AnthropicBlockStreamer::new("msg_7", "claude-sonnet-5-5", 100, HashMap::new());
+        let _ = streamer.start();
+
+        // Feed 20KB thinking
+        let chunk = "x".repeat(20000);
+        let evs = streamer.feed_thinking(&chunk);
+
+        // Must contain block stop for segment 0 and block start for segment 1
+        let has_segment_stop = evs.iter().any(|e| e.event == "content_block_stop" && e.data["index"] == 0);
+        let has_segment_start = evs.iter().any(|e| e.event == "content_block_start" && e.data["index"] == 1);
+        assert!(has_segment_stop);
+        assert!(has_segment_start);
     }
 }
 

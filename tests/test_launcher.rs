@@ -22,6 +22,10 @@ fn test_settings_json_generation() {
         "1"
     );
     assert_eq!(
+        val["env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"],
+        "80"
+    );
+    assert_eq!(
         val["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
         cfg.launcher.haiku_model
     );

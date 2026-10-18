@@ -99,6 +99,7 @@ async fn messages_handler(
 ) -> Response {
     let session_key = crate::engine::session::extract_session_key_from_headers_or_req(&headers, &req);
     let calculated_input_tokens = crate::protocol::tokens::TokenCalculator::count_request_tokens(&req) as u64;
+    let is_compact = req.is_compaction_request();
 
     let tools_summary: Vec<String> = req.tools.as_ref().map(|ts| ts.iter().map(|t| t.name.clone()).collect()).unwrap_or_default();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -126,8 +127,8 @@ async fn messages_handler(
     }).unwrap_or_default();
 
     let log_line = format!(
-        "[ts={}] [REQ] model={} stream={} tools={:?} msgs={} last={}\n",
-        now, req.model, req.stream, tools_summary, req.messages.len(), last_preview
+        "[ts={}] [REQ] is_compact={} model={} stream={} tools={:?} msgs={} last={}\n",
+        now, is_compact, req.model, req.stream, tools_summary, req.messages.len(), last_preview
     );
     eprint!("{}", log_line);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/lily2claude_traffic.log") {
@@ -212,7 +213,8 @@ async fn messages_handler(
 
                     tokio::spawn(async move {
                         let mut translator = SseStreamTranslator::new("msg_live", &model_clone)
-                            .with_input_tokens(calculated_input_tokens);
+                            .with_input_tokens(calculated_input_tokens)
+                            .with_compaction(is_compact);
                         for t in tools_decl {
                             translator.register_tool_casing(&t.name);
                         }
@@ -390,7 +392,7 @@ async fn messages_handler(
                     &req_model_clone,
                     calculated_input_tokens,
                     casing_map,
-                );
+                ).with_compaction(is_compact);
 
                 let start_ev = streamer.start();
                 if sse_tx
@@ -520,6 +522,7 @@ pub fn get_streamable_text_end(s: &str) -> usize {
 
 pub fn build_acp_prompt(req: &MessagesRequest) -> String {
     let mut parts = Vec::new();
+    let is_compact = req.is_compaction_request();
 
     // 1. System Prompt Fusion
     let mut sys_text = String::new();
@@ -537,34 +540,38 @@ pub fn build_acp_prompt(req: &MessagesRequest) -> String {
         }
     }
 
-    // 2. Compact Tools Instruction Injection
-    if let Some(tools) = &req.tools {
-        if !tools.is_empty() {
-            let mut tool_guide = String::from(
-                "\n\n[Tools Instruction]\nYou can call tools to perform actions. To call a tool, you MUST format it as:\n<tool_call>\n{\"name\": \"<tool_name>\", \"arguments\": {<args>}}\n</tool_call>\n\nAvailable tools:\n",
-            );
-            for t in tools {
-                let name = &t.name;
-                match name.as_str() {
-                    "Bash" | "bash" => tool_guide.push_str("- bash: {\"command\": \"<command>\"} (Run shell commands in current project directory. Required parameter: 'command').\n"),
-                    "Read" | "read" => tool_guide.push_str("- read: {\"file_path\": \"<file_path>\"} (Read file contents from filesystem. Required parameter: 'file_path').\n"),
-                    "Edit" | "edit" => tool_guide.push_str("- edit: {\"file_path\": \"<file_path>\", \"old_string\": \"<exact text to replace>\", \"new_string\": \"<replacement text>\"} (Replace exact string in file).\n"),
-                    "Write" | "write" => tool_guide.push_str("- write: {\"file_path\": \"<file_path>\", \"content\": \"<file content>\"} (Write file to filesystem).\n"),
-                    _ => {
-                        let props: Vec<String> = t
-                            .input_schema
-                            .get("properties")
-                            .and_then(|p| p.as_object())
-                            .map(|obj| obj.keys().cloned().collect())
-                            .unwrap_or_default();
-                        let desc = t.description.as_deref().unwrap_or("");
-                        let short_desc = if desc.len() > 60 { &desc[..60] } else { desc };
-                        tool_guide.push_str(&format!("- {}: keys: [{}] ({})\n", name, props.join(", "), short_desc));
+    // 2. Compact Tools Instruction Injection (Omitted during compaction)
+    if !is_compact {
+        if let Some(tools) = &req.tools {
+            if !tools.is_empty() {
+                let mut tool_guide = String::from(
+                    "\n\n[Tools Instruction]\nYou can call tools to perform actions. To call a tool, you MUST format it as:\n<tool_call>\n{\"name\": \"<tool_name>\", \"arguments\": {<args>}}\n</tool_call>\n\nAvailable tools:\n",
+                );
+                for t in tools {
+                    let name = &t.name;
+                    match name.as_str() {
+                        "Bash" | "bash" => tool_guide.push_str("- bash: {\"command\": \"<command>\"} (Run shell commands in current project directory. Required parameter: 'command').\n"),
+                        "Read" | "read" => tool_guide.push_str("- read: {\"file_path\": \"<file_path>\"} (Read file contents from filesystem. Required parameter: 'file_path').\n"),
+                        "Edit" | "edit" => tool_guide.push_str("- edit: {\"file_path\": \"<file_path>\", \"old_string\": \"<exact text to replace>\", \"new_string\": \"<replacement text>\"} (Replace exact string in file).\n"),
+                        "Write" | "write" => tool_guide.push_str("- write: {\"file_path\": \"<file_path>\", \"content\": \"<file content>\"} (Write file to filesystem).\n"),
+                        "Glob" | "glob" => tool_guide.push_str("- glob: {\"pattern\": \"<glob_pattern>\"} (Find files matching pattern).\n"),
+                        "Grep" | "grep" => tool_guide.push_str("- grep: {\"pattern\": \"<regex_pattern>\"} (Search file contents for pattern).\n"),
+                        _ => {
+                            let props: Vec<String> = t
+                                .input_schema
+                                .get("properties")
+                                .and_then(|p| p.as_object())
+                                .map(|obj| obj.keys().cloned().collect())
+                                .unwrap_or_default();
+                            let desc = t.description.as_deref().unwrap_or("");
+                            let short_desc = if desc.len() > 60 { &desc[..60] } else { desc };
+                            tool_guide.push_str(&format!("- {}: keys: [{}] ({})\n", name, props.join(", "), short_desc));
+                        }
                     }
                 }
+                tool_guide.push_str("Note: Core execution tools must be lowercase: bash, read, edit, write, glob, grep.\n");
+                sys_text.push_str(&tool_guide);
             }
-            tool_guide.push_str("Note: Core execution tools must be lowercase: bash, read, edit, write, glob, grep.\n");
-            sys_text.push_str(&tool_guide);
         }
     }
 
@@ -638,7 +645,7 @@ pub fn build_acp_prompt(req: &MessagesRequest) -> String {
                             is_error,
                             ..
                         } => {
-                            let text_content = if let Some(s) = content.as_str() {
+                            let raw_content = if let Some(s) = content.as_str() {
                                 s.to_string()
                             } else if let Some(arr) = content.as_array() {
                                 arr.iter()
@@ -647,6 +654,16 @@ pub fn build_acp_prompt(req: &MessagesRequest) -> String {
                                     .join("\n")
                             } else {
                                 content.to_string()
+                            };
+
+                            let text_content = if is_compact && raw_content.len() > 300 {
+                                format!(
+                                    "{}...\n[Output truncated: {} chars]",
+                                    &raw_content[..250],
+                                    raw_content.len()
+                                )
+                            } else {
+                                raw_content
                             };
 
                             let err_str = if is_error.unwrap_or(false) {
@@ -667,6 +684,10 @@ pub fn build_acp_prompt(req: &MessagesRequest) -> String {
                 }
             }
         }
+    }
+
+    if is_compact {
+        parts.push("[COMPACTION DIRECTIVE]\nProduce ONLY the concise summary enclosed within <summary>...</summary> tags.\nDo NOT generate internal reasoning or thinking monologue.\nDo NOT attempt to call any tools.\nStart your response immediately with <summary>.".to_string());
     }
 
     if parts.is_empty() {

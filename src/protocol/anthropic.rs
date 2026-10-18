@@ -17,6 +17,58 @@ pub struct MessagesRequest {
     pub temperature: Option<f32>,
 }
 
+impl MessagesRequest {
+    pub fn is_compaction_request(&self) -> bool {
+        // 1. Check system instructions
+        if let Some(sys) = &self.system {
+            match sys {
+                SystemPrompt::Single(s) => {
+                    if is_compaction_text(s) {
+                        return true;
+                    }
+                }
+                SystemPrompt::Blocks(blocks) => {
+                    for b in blocks {
+                        if is_compaction_text(&b.text) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Check messages in reverse (last user message contains Claude Code compaction prompt)
+        for msg in self.messages.iter().rev() {
+            match &msg.content {
+                AnthropicContent::Text(t) => {
+                    if is_compaction_text(t) {
+                        return true;
+                    }
+                }
+                AnthropicContent::Blocks(blocks) => {
+                    for b in blocks {
+                        if let ContentBlock::Text { text } = b {
+                            if is_compaction_text(text) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+}
+
+pub fn is_compaction_text(text: &str) -> bool {
+    (text.contains("<summary>") && text.contains("Primary Request and Intent"))
+        || text.contains("REMINDER: Do NOT call any tools. Respond with plain text only")
+        || text.contains("Free up context by summarizing the conversation")
+        || text.contains("You are compacting the conversation")
+        || (text.contains("<summary>") && text.contains("</summary>") && text.contains("summariz"))
+}
+
 fn default_max_tokens() -> u32 {
     4096
 }

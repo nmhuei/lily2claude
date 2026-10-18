@@ -26,6 +26,8 @@ pub fn transform_anthropic_to_openai(
         });
     }
 
+    let is_compact = req.is_compaction_request();
+
     // 2. Iterate Messages & Normalize
     for msg in &req.messages {
         match &msg.content {
@@ -64,7 +66,7 @@ pub fn transform_anthropic_to_openai(
                             content,
                             ..
                         } => {
-                            let text_content = if let Some(s) = content.as_str() {
+                            let raw_content = if let Some(s) = content.as_str() {
                                 s.to_string()
                             } else if let Some(arr) = content.as_array() {
                                 arr.iter()
@@ -73,6 +75,16 @@ pub fn transform_anthropic_to_openai(
                                     .join("\n")
                             } else {
                                 content.to_string()
+                            };
+
+                            let text_content = if is_compact && raw_content.len() > 300 {
+                                format!(
+                                    "{}...\n[Output truncated: {} chars]",
+                                    &raw_content[..250],
+                                    raw_content.len()
+                                )
+                            } else {
+                                raw_content
                             };
 
                             messages.push(OpenAiMessage {
@@ -107,34 +119,36 @@ pub fn transform_anthropic_to_openai(
         }
     }
 
-    // 3. Tool schemas conversion
+    // 3. Tool schemas conversion (Never pass tools during compaction)
     let mut tools = Vec::new();
-    if let Some(t_list) = &req.tools {
-        for t in t_list {
-            tools.push(OpenAiTool {
-                tool_type: "function".to_string(),
-                function: OpenAiFunctionDefinition {
-                    name: t.name.to_ascii_lowercase(),
-                    description: t.description.clone(),
-                    parameters: t.input_schema.clone(),
-                },
-            });
-        }
-    }
-
-    // 4. Inject 6 core tools for OpenCode FreeTier bypass if missing
-    if is_opencode {
-        let core = ["bash", "edit", "glob", "grep", "read", "write"];
-        for c in &core {
-            if !tools.iter().any(|t| t.function.name == *c) {
+    if !is_compact {
+        if let Some(t_list) = &req.tools {
+            for t in t_list {
                 tools.push(OpenAiTool {
                     tool_type: "function".to_string(),
                     function: OpenAiFunctionDefinition {
-                        name: c.to_string(),
-                        description: Some(format!("Core {} tool", c)),
-                        parameters: json!({"type": "object", "properties": {}}),
+                        name: t.name.to_ascii_lowercase(),
+                        description: t.description.clone(),
+                        parameters: t.input_schema.clone(),
                     },
                 });
+            }
+        }
+
+        // 4. Inject 6 core tools for OpenCode FreeTier bypass if missing (not during compaction)
+        if is_opencode {
+            let core = ["bash", "edit", "glob", "grep", "read", "write"];
+            for c in &core {
+                if !tools.iter().any(|t| t.function.name == *c) {
+                    tools.push(OpenAiTool {
+                        tool_type: "function".to_string(),
+                        function: OpenAiFunctionDefinition {
+                            name: c.to_string(),
+                            description: Some(format!("Core {} tool", c)),
+                            parameters: json!({"type": "object", "properties": {}}),
+                        },
+                    });
+                }
             }
         }
     }
