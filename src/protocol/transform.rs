@@ -69,10 +69,21 @@ pub fn transform_anthropic_to_openai(
                             let raw_content = if let Some(s) = content.as_str() {
                                 s.to_string()
                             } else if let Some(arr) = content.as_array() {
-                                arr.iter()
-                                    .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                                let joined = arr.iter()
+                                    .filter_map(|item| {
+                                        if let Some(s) = item.as_str() {
+                                            Some(s)
+                                        } else {
+                                            item.get("text").and_then(|t| t.as_str())
+                                        }
+                                    })
                                     .collect::<Vec<_>>()
-                                    .join("\n")
+                                    .join("\n");
+                                if joined.is_empty() {
+                                    content.to_string()
+                                } else {
+                                    joined
+                                }
                             } else {
                                 content.to_string()
                             };

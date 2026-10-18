@@ -64,21 +64,23 @@ fn repair_json_syntax(input: &str) -> Option<String> {
             if escape {
                 escape = false;
                 match c {
-                    '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u' => {
+                    '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' => {
                         out.push('\\');
                         out.push(c);
+                    }
+                    'u' => {
+                        out.push('\\');
+                        out.push('u');
                     }
                     '\'' => {
                         // \' is invalid in JSON; replace with unescaped '
                         out.push('\'');
                     }
-                    'd' | 's' | 'w' | 'D' | 'S' | 'W' => {
-                        // Regex character class escape: in JSON string it needs an extra backslash
-                        out.push_str("\\\\");
-                        out.push(c);
-                    }
                     other => {
-                        out.push('\\');
+                        // In standard JSON, any escape other than " \ / b f n r t u is illegal!
+                        // e.g. \., \$, \*, \+, \?, \[, \], \(, \), \{, \}, \d, \s, \w, etc.
+                        // Doubling the backslash produces a valid escaped backslash in JSON string.
+                        out.push_str("\\\\");
                         out.push(other);
                     }
                 }
@@ -183,14 +185,19 @@ pub fn repair_tool_arguments(raw: &str) -> String {
 
     // Convert Python-like single-quoted dicts: {'key': 'val'}
     let mut working = candidate.clone();
-    if (working.starts_with('{') || working.starts_with('['))
-        && working.contains('\'')
-        && !working.contains('"')
-    {
-        working = convert_single_to_double_quotes(&working);
-        if serde_json::from_str::<Value>(&working).is_ok() {
-            return working;
+    if working.starts_with('{') || working.starts_with('[') {
+        if working.contains('\'') && !working.contains('"') {
+            let converted = convert_single_to_double_quotes(&working);
+            if serde_json::from_str::<Value>(&converted).is_ok() {
+                return converted;
+            }
+            working = converted;
+        } else if working.contains('\'') {
+            static RE_SINGLE_KEY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"'([a-zA-Z0-9_-]+)'\s*:").unwrap());
+            working = RE_SINGLE_KEY.replace_all(&working, "\"$1\":").to_string();
         }
+        static RE_UNQUOTED_KEY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"([{,]\s*)([a-zA-Z0-9_-]+)\s*:"#).unwrap());
+        working = RE_UNQUOTED_KEY.replace_all(&working, "$1\"$2\":").to_string();
     }
 
     // Apply robust scanner for literal newlines, invalid escapes, and bracket balance
@@ -306,6 +313,10 @@ impl ToolCallRepairEngine {
             .replace("</invoke>", "")
             .replace("</function_call>", "")
             .replace("</action>", "")
+            .replace("<｜tool call end｜>", "")
+            .replace("<|tool call end|>", "")
+            .replace("<｜tool sep｜>", "")
+            .replace("<|tool sep|>", "")
             .trim()
             .to_string()
     }
@@ -408,7 +419,15 @@ impl ToolCallRepairEngine {
                 }
             }
             "web_search" | "websearch" => {
-                casing_map.get("websearch").cloned().unwrap_or_else(|| "WebSearch".to_string())
+                if let Some(w) = casing_map.get("websearch") {
+                    w.clone()
+                } else if let Some(w) = casing_map.get("web_search") {
+                    w.clone()
+                } else if let Some(w) = casing_map.keys().find(|k| k.starts_with("web_search_")) {
+                    casing_map[w].clone()
+                } else {
+                    "WebSearch".to_string()
+                }
             }
             "web_fetch" | "webfetch" | "fetch" | "curl" => {
                 casing_map.get("webfetch").cloned().unwrap_or_else(|| "WebFetch".to_string())
@@ -722,7 +741,7 @@ impl ToolCallRepairEngine {
                     }
                 }
                 obj.retain(|k, _| k == "pattern" || k == "path" || k == "glob" || k == "case_sensitive");
-            } else if lower_target == "websearch" {
+            } else if lower_target == "websearch" || lower_target == "web_search" || lower_target.starts_with("web_search_") {
                 if let Some(q) = obj.remove("q")
                     .or_else(|| obj.remove("search_query"))
                     .or_else(|| obj.remove("term"))
@@ -1344,5 +1363,35 @@ mod tests {
         assert_eq!(calls[0].name, "Grep");
         assert_eq!(calls[0].arguments["pattern"], "fn test");
         assert_eq!(calls[0].arguments["path"], "tests");
+    }
+
+    #[test]
+    fn test_repair_regex_dots_and_dollar() {
+        let raw = r#"{"command": "grep 'foo\.bar\$' file.txt"}"#;
+        let repaired = repair_tool_arguments(raw);
+        let val: Value = serde_json::from_str(&repaired).expect("Should parse with doubled escape");
+        assert_eq!(val["command"], r#"grep 'foo\.bar\$' file.txt"#);
+    }
+
+    #[test]
+    fn test_repair_unquoted_keys() {
+        let raw = "{command: \"ls -la\", timeout: 5000}";
+        let repaired = repair_tool_arguments(raw);
+        let val: Value = serde_json::from_str(&repaired).expect("Should parse unquoted keys");
+        assert_eq!(val["command"], "ls -la");
+        assert_eq!(val["timeout"], 5000);
+    }
+
+    #[test]
+    fn test_websearch_casing_and_arg_normalization() {
+        let mut map = HashMap::new();
+        map.insert("web_search_20250305".to_string(), "web_search_20250305".to_string());
+
+        let mapped = ToolCallRepairEngine::map_tool_name("web_search", &map);
+        assert_eq!(mapped, "web_search_20250305");
+
+        let args = json!({"search_query": "ctf steganography"});
+        let normalized = ToolCallRepairEngine::normalize_arguments(&mapped, args);
+        assert_eq!(normalized["query"], "ctf steganography");
     }
 }

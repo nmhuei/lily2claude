@@ -970,6 +970,9 @@ impl AnthropicBlockStreamer {
             ("<tool_call", "</tool_call>"),
             ("<function_call", "</function_call>"),
             ("<invoke", "</invoke>"),
+            ("<action", "</action>"),
+            ("<｜tool call begin｜>", "<｜tool call end｜>"),
+            ("<|tool call begin|>", "<|tool call end|>"),
         ];
 
         let mut earliest: Option<(usize, usize, &'static str)> = None;
@@ -997,6 +1000,9 @@ impl AnthropicBlockStreamer {
             "<tool_call>", "<tool_call ", "<tool_call\n", "<tool_call", "<tool_cal", "<tool_ca", "<tool_c", "<tool_", "<tool", "<too", "<to",
             "<function_call>", "<function_call ", "<function_call\n", "<function_call", "<function_ca", "<function_c", "<function_", "<function",
             "<invoke ", "<invoke\n", "<invoke", "<invok", "<invo", "<inv",
+            "<action>", "<action ", "<action\n", "<action", "<actio", "<acti", "<act", "<ac",
+            "<｜tool call begin｜>", "<｜tool call begin", "<｜tool call", "<｜tool", "<｜too", "<｜to", "<｜t", "<｜",
+            "<|tool call begin|>", "<|tool call begin", "<|tool call", "<|tool", "<|too", "<|to",
             "<",
         ];
         for p in prefixes {
@@ -1213,6 +1219,40 @@ mod tests {
         let has_segment_start = evs.iter().any(|e| e.event == "content_block_start" && e.data["index"] == 1);
         assert!(has_segment_stop);
         assert!(has_segment_start);
+    }
+
+    #[test]
+    fn test_streamer_action_tag() {
+        let mut casing_map = HashMap::new();
+        casing_map.insert("bash".to_string(), "Bash".to_string());
+        let mut streamer = AnthropicBlockStreamer::new("msg_action", "claude-sonnet-5-5", 100, casing_map);
+        let _ = streamer.start();
+
+        let chunk = "Executing build:\n<action name=\"Bash\">{\"command\": \"cargo build\"}</action>\nDone.";
+        let evs = streamer.feed_text(chunk);
+
+        let has_tool_start = evs.iter().any(|e| e.event == "content_block_start" && e.data["content_block"]["name"] == "Bash");
+        assert!(has_tool_start);
+
+        let final_evs = streamer.finish(100, 30, 0);
+        assert_eq!(final_evs.iter().find(|e| e.event == "message_delta").unwrap().data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_streamer_dsml_tag() {
+        let mut casing_map = HashMap::new();
+        casing_map.insert("bash".to_string(), "Bash".to_string());
+        let mut streamer = AnthropicBlockStreamer::new("msg_dsml", "claude-sonnet-5-5", 100, casing_map);
+        let _ = streamer.start();
+
+        let chunk = "Running command:\n<｜tool calls begin｜><｜tool call begin｜>function<｜tool sep｜>bash\n{\"command\": \"git status\"}<｜tool call end｜><｜tool calls end｜>";
+        let evs = streamer.feed_text(chunk);
+
+        let has_tool_start = evs.iter().any(|e| e.event == "content_block_start" && e.data["content_block"]["name"] == "Bash");
+        assert!(has_tool_start);
+
+        let final_evs = streamer.finish(100, 30, 0);
+        assert_eq!(final_evs.iter().find(|e| e.event == "message_delta").unwrap().data["delta"]["stop_reason"], "tool_use");
     }
 }
 

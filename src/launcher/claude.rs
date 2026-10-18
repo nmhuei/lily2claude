@@ -52,8 +52,13 @@ pub fn ensure_server_running(port: u16) {
         .arg(port.to_string())
         .spawn();
 
-    // Small wait for server bind
-    std::thread::sleep(Duration::from_millis(500));
+    // Poll up to 2 seconds for server bind
+    for _ in 0..20 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 pub fn launch_claude(model: &str, port: u16, extra_args: &[String]) -> anyhow::Result<()> {

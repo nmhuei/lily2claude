@@ -317,28 +317,66 @@ async fn messages_handler(
                 .await;
 
                 match wait_res {
-                    Ok((title_text, Ok(Ok(usage)))) => {
+                    Ok((raw_text, Ok(Ok(usage)))) => {
                         let out_tokens = if usage.output_tokens > 0 {
                             usage.output_tokens
                         } else {
-                            crate::protocol::tokens::TokenCalculator::count_text(&title_text).max(1) as u64
+                            crate::protocol::tokens::TokenCalculator::count_text(&raw_text).max(1) as u64
                         };
                         let turn_usage = crate::protocol::tokens::TokenUsage::new(calculated_input_tokens, out_tokens);
                         state.token_tracker.record_turn(&session_key, &req.model, turn_usage).await;
 
-                        let final_title = if title_text.trim().is_empty() {
-                            "Session Title"
-                        } else {
-                            title_text.trim()
-                        };
+                        let casing_map: std::collections::HashMap<String, String> = req.tools.as_ref().map(|ts| {
+                            ts.iter().map(|t| (t.resolved_name().to_ascii_lowercase(), t.resolved_name().to_string())).collect()
+                        }).unwrap_or_default();
+
+                        let repaired_tools = crate::protocol::repair::ToolCallRepairEngine::detect_and_extract(&raw_text, &casing_map);
+                        let clean_text = crate::protocol::repair::ToolCallRepairEngine::clean_user_visible_text(&raw_text);
+                        let clean_text = crate::protocol::sanitize::strip_system_tags(&clean_text);
+
+                        let mut content_blocks = Vec::new();
+                        if !clean_text.trim().is_empty() {
+                            let text_val = if is_compact && !clean_text.contains("<summary>") {
+                                format!("<summary>\n{}\n</summary>", clean_text.trim())
+                            } else {
+                                clean_text.trim().to_string()
+                            };
+                            content_blocks.push(json!({
+                                "type": "text",
+                                "text": text_val
+                            }));
+                        }
+
+                        let has_tools = !repaired_tools.is_empty();
+                        for (idx, tool) in repaired_tools.into_iter().enumerate() {
+                            if let Some(valid) = crate::protocol::repair::ToolCallRepairEngine::sanitize_and_validate(tool.name, tool.arguments, &casing_map) {
+                                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                                let call_id = format!("call_acp_{}_{}", now_ms, idx);
+                                content_blocks.push(json!({
+                                    "type": "tool_use",
+                                    "id": call_id,
+                                    "name": valid.name,
+                                    "input": valid.arguments
+                                }));
+                            }
+                        }
+
+                        if content_blocks.is_empty() {
+                            content_blocks.push(json!({
+                                "type": "text",
+                                "text": if is_compact { "<summary>\nCompaction complete.\n</summary>" } else { "Done." }
+                            }));
+                        }
+
+                        let stop_reason = if has_tools { "tool_use" } else { "end_turn" };
 
                         return Json(json!({
-                            "id": "msg_title",
+                            "id": "msg_non_stream",
                             "type": "message",
                             "role": "assistant",
                             "model": req.model,
-                            "content": [{"type": "text", "text": final_title}],
-                            "stop_reason": "end_turn",
+                            "content": content_blocks,
+                            "stop_reason": stop_reason,
                             "usage": {"input_tokens": calculated_input_tokens, "output_tokens": out_tokens}
                         }))
                         .into_response();
@@ -650,10 +688,21 @@ pub fn build_acp_prompt(req: &MessagesRequest) -> String {
                             let raw_content = if let Some(s) = content.as_str() {
                                 s.to_string()
                             } else if let Some(arr) = content.as_array() {
-                                arr.iter()
-                                    .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                                let joined = arr.iter()
+                                    .filter_map(|item| {
+                                        if let Some(s) = item.as_str() {
+                                            Some(s)
+                                        } else {
+                                            item.get("text").and_then(|t| t.as_str())
+                                        }
+                                    })
                                     .collect::<Vec<_>>()
-                                    .join("\n")
+                                    .join("\n");
+                                if joined.is_empty() {
+                                    content.to_string()
+                                } else {
+                                    joined
+                                }
                             } else {
                                 content.to_string()
                             };
