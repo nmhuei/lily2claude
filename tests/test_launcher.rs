@@ -29,4 +29,9 @@ fn test_settings_json_generation() {
         val["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
         cfg.launcher.haiku_model
     );
+    assert_eq!(
+        val["skipDangerousModePermissionPrompt"],
+        true
+    );
+    assert!(cfg.launcher.dangerously_skip_permissions);
 }

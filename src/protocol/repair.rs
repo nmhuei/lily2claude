@@ -378,6 +378,10 @@ impl ToolCallRepairEngine {
             "read" | "fileread" | "readfile" | "file_read" | "view" | "cat" | "show" | "view_file" => {
                 if let Some(r) = casing_map.get("read") {
                     r.clone()
+                } else if let Some(fr) = casing_map.get("fileread") {
+                    fr.clone()
+                } else if let Some(fr) = casing_map.get("file_read") {
+                    fr.clone()
                 } else if let Some(v) = casing_map.get("view") {
                     v.clone()
                 } else {
@@ -385,10 +389,26 @@ impl ToolCallRepairEngine {
                 }
             }
             "edit" | "fileedit" | "editfile" | "file_edit" | "modify" | "patch" => {
-                casing_map.get("edit").cloned().unwrap_or_else(|| "Edit".to_string())
+                if let Some(e) = casing_map.get("edit") {
+                    e.clone()
+                } else if let Some(fe) = casing_map.get("fileedit") {
+                    fe.clone()
+                } else if let Some(fe) = casing_map.get("file_edit") {
+                    fe.clone()
+                } else {
+                    "Edit".to_string()
+                }
             }
             "write" | "filewrite" | "file_write" | "createfile" | "create_file" | "create" | "save" => {
-                casing_map.get("write").cloned().unwrap_or_else(|| "Write".to_string())
+                if let Some(w) = casing_map.get("write") {
+                    w.clone()
+                } else if let Some(fw) = casing_map.get("filewrite") {
+                    fw.clone()
+                } else if let Some(fw) = casing_map.get("file_write") {
+                    fw.clone()
+                } else {
+                    "Write".to_string()
+                }
             }
             "bash" | "execute_bash" | "execute" | "sh" | "terminal" | "shell" | "run" | "exec" | "command" | "cmd" => {
                 casing_map.get("bash").cloned().unwrap_or_else(|| "Bash".to_string())
@@ -563,7 +583,7 @@ impl ToolCallRepairEngine {
                 // Note: Never prepend cd before git because Claude Code security sandbox explicitly denies it.
                 // Claude Code CLI is already running in the workspace directory.
                 obj.retain(|k, _| k == "command" || k == "description" || k == "timeout");
-            } else if lower_target == "read" || lower_target == "view" {
+            } else if lower_target == "read" || lower_target == "view" || lower_target == "fileread" || lower_target == "file_read" {
                 let target_param = if lower_target == "view" { "path" } else { "file_path" };
                 let alt_param = if lower_target == "view" { "file_path" } else { "path" };
 
@@ -642,7 +662,7 @@ impl ToolCallRepairEngine {
 
                 // Strictly retain only valid Claude Code Read parameters: file_path, offset, limit
                 obj.retain(|k, _| k == "file_path" || k == "offset" || k == "limit");
-            } else if lower_target == "edit" {
+            } else if lower_target == "edit" || lower_target == "fileedit" || lower_target == "file_edit" {
                 if let Some(val) = obj.remove("path")
                     .or_else(|| obj.remove("file"))
                     .or_else(|| obj.remove("filepath"))
@@ -684,7 +704,7 @@ impl ToolCallRepairEngine {
 
                 // Strictly retain only valid Claude Code Edit parameters: file_path, old_string, new_string, replace_all
                 obj.retain(|k, _| k == "file_path" || k == "old_string" || k == "new_string" || k == "replace_all");
-            } else if lower_target == "write" {
+            } else if lower_target == "write" || lower_target == "filewrite" || lower_target == "file_write" {
                 if let Some(val) = obj.remove("path")
                     .or_else(|| obj.remove("file"))
                     .or_else(|| obj.remove("filepath"))
@@ -824,7 +844,7 @@ impl ToolCallRepairEngine {
 
     pub fn sanitize_and_validate(mut mapped_name: String, mut norm_args: Value, casing_map: &HashMap<String, String>) -> Option<RepairedToolCall> {
         let lower = mapped_name.to_ascii_lowercase();
-        if lower == "read" || lower == "view" {
+        if lower == "read" || lower == "view" || lower == "fileread" || lower == "file_read" {
             if let Some(path_str) = norm_args.get("file_path").or_else(|| norm_args.get("path")).and_then(|v| v.as_str()) {
                 if path_str.trim().is_empty() {
                     return None;
@@ -845,12 +865,12 @@ impl ToolCallRepairEngine {
             if !has_cmd {
                 return None;
             }
-        } else if lower == "write" {
+        } else if lower == "write" || lower == "filewrite" || lower == "file_write" {
             let has_path = norm_args.get("file_path").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
             if !has_path {
                 return None;
             }
-        } else if lower == "edit" {
+        } else if lower == "edit" || lower == "fileedit" || lower == "file_edit" {
             let has_path = norm_args.get("file_path").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
             let has_old = norm_args.get("old_string").and_then(|v| v.as_str()).is_some();
             let has_new = norm_args.get("new_string").and_then(|v| v.as_str()).is_some();
@@ -1393,5 +1413,43 @@ mod tests {
         let args = json!({"search_query": "ctf steganography"});
         let normalized = ToolCallRepairEngine::normalize_arguments(&mapped, args);
         assert_eq!(normalized["query"], "ctf steganography");
+    }
+
+    #[test]
+    fn test_file_edit_write_read_casing_and_validation() {
+        let mut map = HashMap::new();
+        map.insert("fileedit".to_string(), "FileEdit".to_string());
+        map.insert("filewrite".to_string(), "FileWrite".to_string());
+        map.insert("fileread".to_string(), "FileRead".to_string());
+
+        // 1. Model calls "edit"
+        let edit_xml = r#"<tool_call>
+{"name": "edit", "arguments": {"path": "src/main.rs", "old_text": "hello", "new_text": "world"}}
+</tool_call>"#;
+        let calls = ToolCallRepairEngine::detect_and_extract(edit_xml, &map);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "FileEdit");
+        assert_eq!(calls[0].arguments["file_path"], "src/main.rs");
+        assert_eq!(calls[0].arguments["old_string"], "hello");
+        assert_eq!(calls[0].arguments["new_string"], "world");
+
+        // 2. Model calls "write"
+        let write_xml = r#"<tool_call>
+{"name": "write", "arguments": {"path": "test.txt", "contents": "123"}}
+</tool_call>"#;
+        let calls = ToolCallRepairEngine::detect_and_extract(write_xml, &map);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "FileWrite");
+        assert_eq!(calls[0].arguments["file_path"], "test.txt");
+        assert_eq!(calls[0].arguments["content"], "123");
+
+        // 3. Model calls "read"
+        let read_xml = r#"<tool_call>
+{"name": "read", "arguments": {"path": "Cargo.toml"}}
+</tool_call>"#;
+        let calls = ToolCallRepairEngine::detect_and_extract(read_xml, &map);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "FileRead");
+        assert_eq!(calls[0].arguments["file_path"], "Cargo.toml");
     }
 }

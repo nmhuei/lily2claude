@@ -99,3 +99,45 @@ fn test_web_search_tool_deserialization_without_input_schema() {
     assert_eq!(tools[1].resolved_name(), "Bash");
     assert_eq!(tools[1].schema()["type"], "object");
 }
+
+#[test]
+fn test_strip_thinking_text_markers_from_history() {
+    let req = MessagesRequest {
+        model: "deepseek-v4.1-flash".to_string(),
+        messages: vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Text("hello".to_string()),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: AnthropicContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "💭 Thinking:\nInspecting files\n💭 (Done thinking)\n\nHere is your file list.".to_string(),
+                    },
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_subagent".to_string(),
+                    content: json!("💭 Thinking:\nSubagent reasoning...\n💭 (Done thinking)\n\nFinished subtask successfully."),
+                    is_error: None,
+                }]),
+            },
+        ],
+        system: None,
+        tools: None,
+        stream: false,
+        max_tokens: 1024,
+        temperature: None,
+    };
+
+    let openai_req = transform_anthropic_to_openai(&req, false).expect("Transform must succeed");
+    assert_eq!(openai_req.messages[1].role, "assistant");
+    assert_eq!(openai_req.messages[1].content.as_deref(), Some("Here is your file list."));
+
+    assert_eq!(openai_req.messages[2].role, "tool");
+    assert_eq!(openai_req.messages[2].content.as_deref(), Some("Finished subtask successfully."));
+}
+

@@ -119,6 +119,7 @@ impl Agent for OpenCodeAgent {
                     Err(e) => {
                         let err_str = e.to_string();
                         eprintln!("[OpenCode execute_turn] attempt {} failed: {}", attempt, err_str);
+                        mgr.evict_session(key, self.id()).await;
                         if err_str.contains("provider.invalid-output")
                             || err_str.contains("-32603")
                             || err_str.contains("OpenAI Chat tool call delta is missing id or name")

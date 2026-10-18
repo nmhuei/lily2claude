@@ -29,7 +29,8 @@ impl AcpClient {
         cmd.args(&self.command[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         // Isolate opencode data directory and inject WARP proxy if available
         if self.command[0].contains("opencode") {
@@ -157,6 +158,61 @@ impl AcpClient {
 
         while let Some(line) = reader.next_line().await? {
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                // Auto-approve session/request_permission to bypass permission prompts automatically
+                if let (Some(method), Some(req_id)) = (v.get("method").and_then(|m| m.as_str()), v.get("id")) {
+                    if method == "session/request_permission" {
+                        let option_id = v.pointer("/params/options")
+                            .and_then(|opts| opts.as_array())
+                            .and_then(|arr| {
+                                arr.iter().find_map(|opt| {
+                                    let kind = opt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                                    let opt_id = opt.get("optionId").and_then(|id| id.as_str())?;
+                                    if kind == "allow_always" || opt_id == "always" {
+                                        Some(opt_id.to_string())
+                                    } else {
+                                        None
+                                    }
+                                }).or_else(|| {
+                                    arr.iter().find_map(|opt| {
+                                        let kind = opt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                                        let opt_id = opt.get("optionId").and_then(|id| id.as_str())?;
+                                        if kind == "allow_once" || opt_id == "once" {
+                                            Some(opt_id.to_string())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                            })
+                            .unwrap_or_else(|| "always".to_string());
+
+                        let reply = json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": {
+                                "outcome": {
+                                    "outcome": "selected",
+                                    "optionId": option_id
+                                }
+                            }
+                        });
+                        stdin.write_all(format!("{}\n", reply).as_bytes()).await?;
+                        stdin.flush().await?;
+                        eprintln!("[ACP request_permission auto-approved] id={:?} optionId={}", req_id, option_id);
+                        continue;
+                    }
+                }
+
+                // Filter notifications: if line contains a sessionId, verify it matches session_id!
+                if let Some(sid) = v.pointer("/params/sessionId")
+                    .or_else(|| v.pointer("/params/update/sessionId"))
+                    .and_then(|s| s.as_str())
+                {
+                    if sid != session_id {
+                        continue;
+                    }
+                }
+
                 let update_type = v.pointer("/params/update/sessionUpdate").and_then(|u| u.as_str());
                 if update_type == Some("agent_thought_chunk") {
                     if let Some(thought) = v
@@ -188,15 +244,23 @@ impl AcpClient {
                 }
 
                 if let Some(err) = v.get("error") {
-                    eprintln!(">>> ACP RPC ERROR: {:?}", err);
-                    prompt_err = Some(err.clone());
+                    if v.get("id").and_then(|id| id.as_u64()) == Some(3) {
+                        eprintln!(">>> ACP RPC ERROR for prompt id 3: {:?}", err);
+                        prompt_err = Some(err.clone());
+                    } else {
+                        eprintln!(">>> ACP RPC ERROR ignoring mismatched id {:?}: {:?}", v.get("id"), err);
+                    }
                 }
 
-                let is_stop = v.pointer("/result/stopReason").is_some()
-                    || v.pointer("/params/update/stopReason").is_some()
-                    || v.pointer("/params/stopReason").is_some();
                 let is_matching_result = v.get("id").and_then(|id| id.as_u64()) == Some(3);
-                if is_stop || (is_matching_result && (v.get("result").is_some() || v.get("error").is_some())) {
+                let is_stop_notification = v.pointer("/params/update/stopReason").is_some()
+                    || v.pointer("/params/stopReason").is_some();
+                let is_stop_result = is_matching_result
+                    && (v.pointer("/result/stopReason").is_some()
+                        || v.get("result").is_some()
+                        || v.get("error").is_some());
+
+                if is_stop_notification || is_stop_result {
                     break;
                 }
             }
@@ -207,6 +271,7 @@ impl AcpClient {
         }
 
         let _ = child.kill().await;
+        let _ = child.wait().await;
         let final_usage = captured_usage.unwrap_or_default();
         if final_usage.total() > 0 {
             let _ = tx.send(AcpOutputChunk::Usage(final_usage)).await;

@@ -52,10 +52,15 @@ pub struct SseStreamTranslator {
     input_tokens: u64,
     upstream_output_tokens: Option<u64>,
     pub is_compact: bool,
+    pub stream_thinking_as_text: bool,
+    in_thinking_mode: bool,
 }
 
 impl SseStreamTranslator {
     pub fn new(message_id: &str, model: &str) -> Self {
+        let stream_thinking = std::env::var("L2C_STREAM_THINKING")
+            .map(|v| v == "1" || v == "true" || v == "text")
+            .unwrap_or(false);
         Self {
             message_id: message_id.to_string(),
             model: model.to_string(),
@@ -73,6 +78,8 @@ impl SseStreamTranslator {
             input_tokens: 50,
             upstream_output_tokens: None,
             is_compact: false,
+            stream_thinking_as_text: stream_thinking,
+            in_thinking_mode: false,
         }
     }
 
@@ -83,6 +90,11 @@ impl SseStreamTranslator {
 
     pub fn with_compaction(mut self, is_compact: bool) -> Self {
         self.is_compact = is_compact;
+        self
+    }
+
+    pub fn with_stream_thinking_as_text(mut self, enabled: bool) -> Self {
+        self.stream_thinking_as_text = enabled;
         self
     }
 
@@ -139,47 +151,133 @@ impl SseStreamTranslator {
             // 1. Thinking / Reasoning content
             if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
                 if !reasoning.is_empty() {
-                    if self.state != BlockState::Thinking {
-                        if self.state != BlockState::None {
+                    if self.stream_thinking_as_text {
+                        if self.state != BlockState::Text {
+                            if self.state != BlockState::None {
+                                events.push(self.create_event(
+                                    "content_block_stop",
+                                    json!({"type": "content_block_stop", "index": self.block_index}),
+                                ));
+                                self.block_index += 1;
+                            } else if self.has_emitted_blocks {
+                                self.block_index += 1;
+                            }
+                            self.has_emitted_blocks = true;
+                            self.has_emitted_text = true;
+                            self.state = BlockState::Text;
                             events.push(self.create_event(
-                                "content_block_stop",
-                                json!({"type": "content_block_stop", "index": self.block_index}),
+                                "content_block_start",
+                                json!({
+                                    "type": "content_block_start",
+                                    "index": self.block_index,
+                                    "content_block": {"type": "text", "text": ""}
+                                }),
                             ));
-                            self.block_index += 1;
-                        } else if self.has_emitted_blocks {
-                            self.block_index += 1;
+                            events.push(self.create_event(
+                                "content_block_delta",
+                                json!({
+                                    "type": "content_block_delta",
+                                    "index": self.block_index,
+                                    "delta": {"type": "text_delta", "text": crate::protocol::transform::THINKING_START_MARKER}
+                                }),
+                            ));
+                            self.in_thinking_mode = true;
+                        } else if !self.in_thinking_mode {
+                            events.push(self.create_event(
+                                "content_block_delta",
+                                json!({
+                                    "type": "content_block_delta",
+                                    "index": self.block_index,
+                                    "delta": {"type": "text_delta", "text": crate::protocol::transform::THINKING_START_MARKER}
+                                }),
+                            ));
+                            self.in_thinking_mode = true;
                         }
-                        self.has_emitted_blocks = true;
-                        self.state = BlockState::Thinking;
+
                         events.push(self.create_event(
-                            "content_block_start",
+                            "content_block_delta",
                             json!({
-                                "type": "content_block_start",
+                                "type": "content_block_delta",
                                 "index": self.block_index,
-                                "content_block": {"type": "thinking", "thinking": ""}
+                                "delta": {"type": "text_delta", "text": reasoning}
                             }),
                         ));
+                    } else {
+                        if self.state == BlockState::Text {
+                            // Text block is actively streaming; do not split mid-sentence
+                        } else {
+                            if self.state != BlockState::Thinking {
+                                if self.state != BlockState::None {
+                                    events.push(self.create_event(
+                                        "content_block_stop",
+                                        json!({"type": "content_block_stop", "index": self.block_index}),
+                                    ));
+                                    self.block_index += 1;
+                                } else if self.has_emitted_blocks {
+                                    self.block_index += 1;
+                                }
+                                self.has_emitted_blocks = true;
+                                self.state = BlockState::Thinking;
+                                events.push(self.create_event(
+                                    "content_block_start",
+                                    json!({
+                                        "type": "content_block_start",
+                                        "index": self.block_index,
+                                        "content_block": {"type": "thinking", "thinking": ""}
+                                    }),
+                                ));
+                            }
+                            let est = (reasoning.len() / 4).max(1);
+                            events.push(self.create_event(
+                                "content_block_delta",
+                                json!({
+                                    "type": "content_block_delta",
+                                    "index": self.block_index,
+                                    "delta": {
+                                        "type": "thinking_delta",
+                                        "thinking": reasoning,
+                                        "estimated_tokens": est
+                                    }
+                                }),
+                            ));
+                        }
                     }
-                    events.push(self.create_event(
-                        "content_block_delta",
-                        json!({
-                            "type": "content_block_delta",
-                            "index": self.block_index,
-                            "delta": {"type": "thinking_delta", "thinking": reasoning}
-                        }),
-                    ));
                 }
             }
 
             // 2. Normal text with tool tag leak prevention
             if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
                 if !text.is_empty() {
+                    if self.in_thinking_mode {
+                        self.in_thinking_mode = false;
+                        events.push(self.create_event(
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": self.block_index,
+                                "delta": {"type": "text_delta", "text": format!("\n{}\n\n", crate::protocol::transform::THINKING_END_MARKER)}
+                            }),
+                        ));
+                    }
                     self.accumulated_text.push_str(text);
                     let streamable_end = crate::protocol::repair::ToolCallRepairEngine::get_streamable_text_end(&self.accumulated_text);
                     if streamable_end > self.streamed_text_len {
                         let to_stream = &self.accumulated_text[self.streamed_text_len..streamable_end];
                         if self.state != BlockState::Text {
                             if self.state != BlockState::None {
+                                if self.state == BlockState::Thinking {
+                                    events.push(self.create_event(
+                                        "content_block_delta",
+                                        json!({
+                                            "type": "content_block_delta",
+                                            "index": self.block_index,
+                                            "delta": {
+                                                "type": "signature_delta",
+                                                "signature": "EqQBCgIYAhIM1gbcuvLz1029487561"
+                                            }
+                                        }),
+                                    ));
+                                }
                                 events.push(self.create_event(
                                     "content_block_stop",
                                     json!({"type": "content_block_stop", "index": self.block_index}),
@@ -215,6 +313,17 @@ impl SseStreamTranslator {
 
             // 3. Native Tool Calls
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                if self.in_thinking_mode {
+                    self.in_thinking_mode = false;
+                    events.push(self.create_event(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": self.block_index,
+                            "delta": {"type": "text_delta", "text": format!("\n{}\n\n", crate::protocol::transform::THINKING_END_MARKER)}
+                        }),
+                    ));
+                }
                 for tc in tool_calls {
                     self.has_native_tool_calls = true;
                     let idx = tc.get("index").and_then(|v| v.as_u64()).map(|u| u as usize).unwrap_or(0);
@@ -249,7 +358,32 @@ impl SseStreamTranslator {
         }
         self.finished = true;
 
+        if self.in_thinking_mode {
+            self.in_thinking_mode = false;
+            events.push(self.create_event(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": self.block_index,
+                    "delta": {"type": "text_delta", "text": format!("\n{}\n\n", crate::protocol::transform::THINKING_END_MARKER)}
+                }),
+            ));
+        }
+
         if self.state != BlockState::None && self.state != BlockState::ToolUse {
+            if self.state == BlockState::Thinking {
+                events.push(self.create_event(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": self.block_index,
+                        "delta": {
+                            "type": "signature_delta",
+                            "signature": "EqQBCgIYAhIM1gbcuvLz1029487561"
+                        }
+                    }),
+                ));
+            }
             events.push(self.create_event(
                 "content_block_stop",
                 json!({"type": "content_block_stop", "index": self.block_index}),
@@ -395,7 +529,7 @@ impl SseStreamTranslator {
                         json!({"type": "content_block_stop", "index": self.block_index}),
                     ));
                     self.streamed_text_len = self.accumulated_text.len();
-                } else if !self.has_emitted_text {
+                } else if !self.has_emitted_text && stop_reason != "tool_use" {
                     // Critical: if only thinking was emitted, Claude Code requires at least one visible content block!
                     if self.has_emitted_blocks {
                         self.block_index += 1;
@@ -489,6 +623,8 @@ pub struct AnthropicBlockStreamer {
     pub emitted_tool_count: usize,
     pub has_emitted_text_block: bool,
     pub is_compact: bool,
+    pub stream_thinking_as_text: bool,
+    pub in_thinking_mode: bool,
 }
 
 impl AnthropicBlockStreamer {
@@ -498,6 +634,9 @@ impl AnthropicBlockStreamer {
         input_tokens: u64,
         casing_map: HashMap<String, String>,
     ) -> Self {
+        let stream_thinking = std::env::var("L2C_STREAM_THINKING")
+            .map(|v| v == "1" || v == "true" || v == "text")
+            .unwrap_or(false);
         Self {
             message_id: message_id.to_string(),
             model: model.to_string(),
@@ -510,11 +649,18 @@ impl AnthropicBlockStreamer {
             emitted_tool_count: 0,
             has_emitted_text_block: false,
             is_compact: false,
+            stream_thinking_as_text: stream_thinking,
+            in_thinking_mode: false,
         }
     }
 
     pub fn with_compaction(mut self, is_compact: bool) -> Self {
         self.is_compact = is_compact;
+        self
+    }
+
+    pub fn with_stream_thinking_as_text(mut self, enabled: bool) -> Self {
+        self.stream_thinking_as_text = enabled;
         self
     }
 
@@ -552,11 +698,8 @@ impl AnthropicBlockStreamer {
         for item in items {
             match item {
                 ThinkingRouteItem::SegmentBreak => {
-                    if let Some(idx) = self.tracker.close_thinking() {
-                        events.push(SseEvent::new(
-                            "content_block_stop",
-                            json!({"type": "content_block_stop", "index": idx}),
-                        ));
+                    if !self.stream_thinking_as_text {
+                        self.emit_close_thinking(&mut events);
                     }
                 }
                 ThinkingRouteItem::Thinking(fragment) => {
@@ -584,11 +727,8 @@ impl AnthropicBlockStreamer {
                     self.emit_thinking_fragment(&fragment, &mut events);
                 }
                 ThinkingRouteItem::SegmentBreak => {
-                    if let Some(idx) = self.tracker.close_thinking() {
-                        events.push(SseEvent::new(
-                            "content_block_stop",
-                            json!({"type": "content_block_stop", "index": idx}),
-                        ));
+                    if !self.stream_thinking_as_text {
+                        self.emit_close_thinking(&mut events);
                     }
                 }
                 ThinkingRouteItem::Text(fragment) => {
@@ -600,10 +740,46 @@ impl AnthropicBlockStreamer {
         events
     }
 
+    fn emit_close_thinking(&mut self, events: &mut Vec<SseEvent>) {
+        if let Some(idx) = self.tracker.close_thinking() {
+            events.push(SseEvent::new(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {
+                        "type": "signature_delta",
+                        "signature": "EqQBCgIYAhIM1gbcuvLz1029487561"
+                    }
+                }),
+            ));
+            events.push(SseEvent::new(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": idx}),
+            ));
+        }
+    }
+
     fn emit_thinking_fragment(&mut self, fragment: &str, events: &mut Vec<SseEvent>) {
         if fragment.is_empty() {
             return;
         }
+
+        // Only stream thinking as text if explicitly requested
+        if self.stream_thinking_as_text {
+            if !self.in_thinking_mode {
+                self.in_thinking_mode = true;
+                self.emit_text_delta(crate::protocol::transform::THINKING_START_MARKER, events);
+            }
+            self.emit_text_delta(fragment, events);
+            return;
+        }
+
+        // If a text block is currently actively streaming, do NOT split it mid-sentence
+        if self.tracker.text_idx().is_some() {
+            return;
+        }
+
         let (idx, is_new, closed_text) = self.tracker.ensure_thinking();
         if let Some(c_idx) = closed_text {
             events.push(SseEvent::new(
@@ -626,12 +802,17 @@ impl AnthropicBlockStreamer {
         while !remaining.is_empty() {
             let (sub, rest) = split_utf8_prefix(remaining, RENDER_DELTA_CHUNK_BYTES);
             remaining = rest;
+            let est = (sub.len() / 4).max(1);
             events.push(SseEvent::new(
                 "content_block_delta",
                 json!({
                     "type": "content_block_delta",
                     "index": idx,
-                    "delta": {"type": "thinking_delta", "thinking": sub}
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": sub,
+                        "estimated_tokens": est
+                    }
                 }),
             ));
         }
@@ -640,6 +821,12 @@ impl AnthropicBlockStreamer {
     fn feed_text_internal(&mut self, chunk: &str, events: &mut Vec<SseEvent>) {
         if chunk.is_empty() {
             return;
+        }
+
+        if self.in_thinking_mode {
+            self.in_thinking_mode = false;
+            let close_marker = format!("\n{}\n\n", crate::protocol::transform::THINKING_END_MARKER);
+            self.emit_text_delta(&close_marker, events);
         }
 
         self.text_buffer.push_str(chunk);
@@ -654,7 +841,9 @@ impl AnthropicBlockStreamer {
 
                     if safe_len > self.streamed_in_current_block {
                         let to_stream = self.text_buffer[self.streamed_in_current_block..safe_len].to_string();
-                        self.emit_text_delta(&to_stream, events);
+                        if !to_stream.trim().is_empty() || self.tracker.text_idx().is_some() {
+                            self.emit_text_delta(&to_stream, events);
+                        }
                         self.streamed_in_current_block = safe_len;
                     }
                     break;
@@ -674,6 +863,7 @@ impl AnthropicBlockStreamer {
                             json!({"type": "content_block_stop", "index": c_idx}),
                         ));
                     }
+                    self.emit_close_thinking(events);
 
                     let search_from = tag_start + open_tag_len;
                     if let Some(rel_close) = self.text_buffer[search_from..].find(close_tag) {
@@ -749,6 +939,17 @@ impl AnthropicBlockStreamer {
         let (idx, is_new, closed_thinking) = self.tracker.ensure_text();
         if let Some(c_idx) = closed_thinking {
             events.push(SseEvent::new(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": c_idx,
+                    "delta": {
+                        "type": "signature_delta",
+                        "signature": "EqQBCgIYAhIM1gbcuvLz1029487561"
+                    }
+                }),
+            ));
+            events.push(SseEvent::new(
                 "content_block_stop",
                 json!({"type": "content_block_stop", "index": c_idx}),
             ));
@@ -804,6 +1005,12 @@ impl AnthropicBlockStreamer {
                 }
                 ThinkingRouteItem::SegmentBreak => {}
             }
+        }
+
+        if self.in_thinking_mode {
+            self.in_thinking_mode = false;
+            let close_marker = format!("\n{}\n\n", crate::protocol::transform::THINKING_END_MARKER);
+            self.emit_text_delta(&close_marker, &mut events);
         }
 
         if let Some((tag_start, _, _)) = Self::find_tool_tag_start(&self.text_buffer) {
@@ -875,7 +1082,7 @@ impl AnthropicBlockStreamer {
             } else {
                 let cleaned = crate::protocol::repair::ToolCallRepairEngine::clean_user_visible_text(unclosed_xml);
                 let cleaned = strip_system_tags(&cleaned);
-                if !cleaned.is_empty() {
+                if !cleaned.trim().is_empty() || (self.tracker.text_idx().is_some() && !cleaned.is_empty()) {
                     self.emit_text_delta(&cleaned, &mut events);
                 }
             }
@@ -883,7 +1090,7 @@ impl AnthropicBlockStreamer {
             let remaining = &self.text_buffer[self.streamed_in_current_block..];
             let cleaned = crate::protocol::repair::ToolCallRepairEngine::clean_user_visible_text(remaining);
             let cleaned = strip_system_tags(&cleaned);
-            if !cleaned.is_empty() {
+            if !cleaned.trim().is_empty() || (self.tracker.text_idx().is_some() && !cleaned.is_empty()) {
                 self.emit_text_delta(&cleaned, &mut events);
             }
         }
@@ -901,7 +1108,20 @@ impl AnthropicBlockStreamer {
             }
         }
 
-        for (_, idx) in self.tracker.close_all() {
+        for (kind, idx) in self.tracker.close_all() {
+            if kind == "thinking" {
+                events.push(SseEvent::new(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {
+                            "type": "signature_delta",
+                            "signature": "EqQBCgIYAhIM1gbcuvLz1029487561"
+                        }
+                    }),
+                ));
+            }
             events.push(SseEvent::new(
                 "content_block_stop",
                 json!({"type": "content_block_stop", "index": idx}),
@@ -1167,7 +1387,8 @@ mod tests {
 
     #[test]
     fn test_streamer_leaked_thinking_rerouted_from_text() {
-        let mut streamer = AnthropicBlockStreamer::new("msg_6", "claude-sonnet-5-5", 100, HashMap::new());
+        let mut streamer = AnthropicBlockStreamer::new("msg_6", "claude-sonnet-5-5", 100, HashMap::new())
+            .with_stream_thinking_as_text(false);
         let _ = streamer.start();
 
         // Feed text containing leaked thinking closed by </think>
@@ -1176,10 +1397,11 @@ mod tests {
         // Expected:
         // 1. content_block_start(0, thinking)
         // 2. content_block_delta(0, thinking_delta: "Inspecting codebase structure...")
-        // 3. content_block_stop(0)
-        // 4. content_block_start(1, text)
-        // 5. content_block_delta(1, text_delta: "Here is the project overview.")
-        assert_eq!(evs.len(), 5);
+        // 3. content_block_delta(0, signature_delta)
+        // 4. content_block_stop(0)
+        // 5. content_block_start(1, text)
+        // 6. content_block_delta(1, text_delta: "Here is the project overview.")
+        assert_eq!(evs.len(), 6);
         assert_eq!(evs[0].event, "content_block_start");
         assert_eq!(evs[0].data["index"], 0);
         assert_eq!(evs[0].data["content_block"]["type"], "thinking");
@@ -1187,17 +1409,22 @@ mod tests {
         assert_eq!(evs[1].event, "content_block_delta");
         assert_eq!(evs[1].data["index"], 0);
         assert_eq!(evs[1].data["delta"]["thinking"], "Inspecting codebase structure...");
+        assert!(evs[1].data["delta"]["estimated_tokens"].as_u64().unwrap_or(0) > 0);
 
-        assert_eq!(evs[2].event, "content_block_stop");
+        assert_eq!(evs[2].event, "content_block_delta");
         assert_eq!(evs[2].data["index"], 0);
+        assert_eq!(evs[2].data["delta"]["type"], "signature_delta");
 
-        assert_eq!(evs[3].event, "content_block_start");
-        assert_eq!(evs[3].data["index"], 1);
-        assert_eq!(evs[3].data["content_block"]["type"], "text");
+        assert_eq!(evs[3].event, "content_block_stop");
+        assert_eq!(evs[3].data["index"], 0);
 
-        assert_eq!(evs[4].event, "content_block_delta");
+        assert_eq!(evs[4].event, "content_block_start");
         assert_eq!(evs[4].data["index"], 1);
-        assert_eq!(evs[4].data["delta"]["text"], "Here is the project overview.");
+        assert_eq!(evs[4].data["content_block"]["type"], "text");
+
+        assert_eq!(evs[5].event, "content_block_delta");
+        assert_eq!(evs[5].data["index"], 1);
+        assert_eq!(evs[5].data["delta"]["text"], "Here is the project overview.");
 
         let final_evs = streamer.finish(100, 40, 0);
         assert_eq!(final_evs[0].event, "content_block_stop");
@@ -1207,7 +1434,8 @@ mod tests {
 
     #[test]
     fn test_streamer_thinking_16kb_segmentation() {
-        let mut streamer = AnthropicBlockStreamer::new("msg_7", "claude-sonnet-5-5", 100, HashMap::new());
+        let mut streamer = AnthropicBlockStreamer::new("msg_7", "claude-sonnet-5-5", 100, HashMap::new())
+            .with_stream_thinking_as_text(false);
         let _ = streamer.start();
 
         // Feed 20KB thinking
@@ -1253,6 +1481,176 @@ mod tests {
 
         let final_evs = streamer.finish(100, 30, 0);
         assert_eq!(final_evs.iter().find(|e| e.event == "message_delta").unwrap().data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_anthropic_block_streamer_thinking_as_text() {
+        let mut streamer = AnthropicBlockStreamer::new("msg_t2", "claude-sonnet-5-5", 100, HashMap::new())
+            .with_stream_thinking_as_text(true);
+        let _ = streamer.start();
+
+        let evs1 = streamer.feed_thinking("Exploring the problem space...");
+        assert!(evs1.iter().any(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "text"));
+        assert!(evs1.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta"
+                && e.data["delta"]["text"].as_str().unwrap_or("").contains("💭 Thinking:\n")
+        }));
+        assert!(evs1.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta"
+                && e.data["delta"]["text"].as_str().unwrap_or("").contains("Exploring the problem space...")
+        }));
+
+        let evs2 = streamer.feed_text("Here is the solution.");
+        assert!(evs2.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta"
+                && e.data["delta"]["text"].as_str().unwrap_or("").contains("💭 (Done thinking)")
+        }));
+        assert!(evs2.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta"
+                && e.data["delta"]["text"].as_str().unwrap_or("").contains("Here is the solution.")
+        }));
+
+        let final_evs = streamer.finish(100, 50, 0);
+        assert!(final_evs.iter().any(|e| e.event == "content_block_stop"));
+        assert!(final_evs.iter().any(|e| e.event == "message_stop"));
+    }
+
+    #[test]
+    fn test_sse_stream_translator_thinking_as_text() {
+        let mut translator = SseStreamTranslator::new("msg_t1", "deepseek")
+            .with_stream_thinking_as_text(true);
+
+        // Feed reasoning chunk
+        let chunk1 = json!({
+            "choices": [{
+                "delta": {
+                    "reasoning_content": "Analyzing steganography in avatar.png..."
+                }
+            }]
+        }).to_string();
+        let evs1 = translator.feed_chunk(&chunk1);
+
+        // Must start text block and emit text deltas
+        let has_text_start = evs1.iter().any(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "text");
+        assert!(has_text_start, "Expected content_block_start with type text");
+
+        let has_thinking_prefix = evs1.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta"
+                && e.data["delta"]["text"].as_str().unwrap_or("").contains("💭 Thinking:\n")
+        });
+        assert!(has_thinking_prefix, "Expected text_delta with thinking start marker");
+
+        let has_reasoning_text = evs1.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta"
+                && e.data["delta"]["text"].as_str().unwrap_or("").contains("Analyzing steganography")
+        });
+        assert!(has_reasoning_text, "Expected reasoning chunk as text_delta");
+
+        // Feed normal text chunk
+        let chunk2 = json!({
+            "choices": [{
+                "delta": {
+                    "content": "Found 3 hidden chunks."
+                }
+            }]
+        }).to_string();
+        let evs2 = translator.feed_chunk(&chunk2);
+
+        // Must emit thinking end marker and then the normal text
+        let has_end_marker = evs2.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta"
+                && e.data["delta"]["text"].as_str().unwrap_or("").contains("💭 (Done thinking)")
+        });
+        assert!(has_end_marker, "Expected text_delta with thinking end marker");
+    }
+
+    #[test]
+    fn test_thinking_after_text_never_splits_text_block() {
+        let mut streamer = AnthropicBlockStreamer::new("msg_no_split", "claude-sonnet-5-5", 100, HashMap::new())
+            .with_stream_thinking_as_text(false);
+        let _ = streamer.start();
+
+        // 1. First feed normal text
+        let evs1 = streamer.feed_text("Workflow tool không có trong session này — tôi fan-out trực tiếp bằng 7 sub");
+        let start_text_count = evs1.iter().filter(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "text").count();
+        assert_eq!(start_text_count, 1);
+
+        // 2. Leaked or delayed thinking chunk arrives mid-sentence
+        let evs2 = streamer.feed_thinking("thinking from another session or delayed reasoning");
+        // Must NOT close the text block or open a thinking block!
+        let has_thinking_start = evs2.iter().any(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking");
+        let has_text_stop = evs2.iter().any(|e| e.event == "content_block_stop");
+        assert!(!has_thinking_start, "Must NOT open thinking block after text started");
+        assert!(!has_text_stop, "Must NOT close text block on mid-sentence thinking");
+        let has_marker = evs2.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["text"].as_str().unwrap_or("").contains("💭")
+        });
+        assert!(!has_marker, "Must NOT emit raw thinking markers into text");
+
+        // 3. Second part of text arrives
+        let evs3 = streamer.feed_text("agent song song, mỗi agent một giả thuyết độc lập.");
+        // Must NOT start another text block (no extra bullet point)
+        let has_new_text_start = evs3.iter().any(|e| e.event == "content_block_start");
+        assert!(!has_new_text_start, "Must NOT start a new text block, sentence must remain unbroken");
+
+        let final_evs = streamer.finish(100, 50, 0);
+        assert_eq!(final_evs[0].event, "content_block_stop");
+        assert_eq!(final_evs[1].event, "message_delta");
+    }
+
+    #[test]
+    fn test_streamer_thinking_between_tools_never_emits_text_markers() {
+        let mut streamer = AnthropicBlockStreamer::new("msg_between", "claude-sonnet-5-5", 100, HashMap::new())
+            .with_stream_thinking_as_text(false);
+        let _ = streamer.start();
+
+        // 1. Initial text and tool
+        let evs1 = streamer.feed_text("Let me inspect directory.\n<tool_call>\n{\"name\": \"Bash\", \"arguments\": {\"command\": \"ls\"}}\n</tool_call>\n");
+        assert!(evs1.iter().any(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"));
+
+        // 2. OpenCode thought arrives after tool
+        let evs2 = streamer.feed_thinking("The directory has 3 files. Let me continue.");
+        // Must emit native thinking_delta, NEVER text_delta with 💭 Thinking:
+        let has_thinking_block = evs2.iter().any(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking");
+        assert!(has_thinking_block, "Expected native thinking block between tools");
+        let has_thinking_delta = evs2.iter().any(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta");
+        assert!(has_thinking_delta, "Expected native thinking_delta");
+        let has_text_delta = evs2.iter().any(|e| e.data["delta"]["type"] == "text_delta");
+        assert!(!has_text_delta, "Must NOT emit text_delta for thinking");
+        let has_raw_marker = evs2.iter().any(|e| e.data["delta"]["text"].as_str().unwrap_or("").contains("💭"));
+        assert!(!has_raw_marker, "Must NOT emit raw thinking markers");
+
+        let finish_evs = streamer.finish(100, 50, 0);
+        let has_sig = finish_evs.iter().any(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta");
+        assert!(has_sig, "Must emit signature_delta before stopping thinking block");
+    }
+
+    #[test]
+    fn test_streamer_thinking_closes_with_signature_delta_on_transition() {
+        let mut streamer = AnthropicBlockStreamer::new("msg_sig", "claude-sonnet-5-5", 100, HashMap::new())
+            .with_stream_thinking_as_text(false);
+        let _ = streamer.start();
+
+        let _ = streamer.feed_thinking("Contemplating solution...");
+        let text_evs = streamer.feed_text("Here is the verified answer.");
+
+        let sig_idx = text_evs.iter().position(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta");
+        let stop_idx = text_evs.iter().position(|e| e.event == "content_block_stop" && e.data["index"] == 0);
+        let text_start_idx = text_evs.iter().position(|e| e.event == "content_block_start" && e.data["index"] == 1);
+
+        assert!(sig_idx.is_some(), "Must emit signature_delta");
+        assert!(stop_idx.is_some(), "Must emit content_block_stop for thinking");
+        assert!(text_start_idx.is_some(), "Must emit content_block_start for text");
+        assert!(sig_idx.unwrap() < stop_idx.unwrap(), "signature_delta must precede content_block_stop");
+        assert!(stop_idx.unwrap() < text_start_idx.unwrap(), "content_block_stop must precede text content_block_start");
     }
 }
 

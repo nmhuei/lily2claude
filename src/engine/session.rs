@@ -82,7 +82,8 @@ impl AcpSession {
         cmd.args(&command[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         let mut proxy_used = None;
 
@@ -243,19 +244,78 @@ impl AcpSession {
         self.stdin.flush().await?;
         eprintln!("[ACP session/prompt sent] id={}", prompt_call_id);
 
-        let _ = std::fs::write("/tmp/last_acp_prompt.txt", prompt);
+        if std::env::var("L2C_DEBUG_LOG").is_ok() {
+            let _ = std::fs::write("/tmp/last_acp_prompt.txt", prompt);
+        }
         let mut captured_usage: Option<crate::protocol::tokens::TokenUsage> = None;
         let mut prompt_err = None;
 
         let mut emitted_tool_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         while let Some(line) = self.reader.next_line().await? {
-            eprintln!("[ACP prompt raw] {}", &line[..line.len().min(120)]);
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/acp_raw.log") {
-                use std::io::Write;
-                let _ = writeln!(f, "{}", line);
+            if std::env::var("L2C_DEBUG_LOG").is_ok() {
+                eprintln!("[ACP prompt raw] {}", &line[..line.len().min(120)]);
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/acp_raw.log") {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", line);
+                }
             }
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                // Auto-approve session/request_permission to bypass permission prompts automatically
+                if let (Some(method), Some(req_id)) = (v.get("method").and_then(|m| m.as_str()), v.get("id")) {
+                    if method == "session/request_permission" {
+                        let option_id = v.pointer("/params/options")
+                            .and_then(|opts| opts.as_array())
+                            .and_then(|arr| {
+                                arr.iter().find_map(|opt| {
+                                    let kind = opt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                                    let opt_id = opt.get("optionId").and_then(|id| id.as_str())?;
+                                    if kind == "allow_always" || opt_id == "always" {
+                                        Some(opt_id.to_string())
+                                    } else {
+                                        None
+                                    }
+                                }).or_else(|| {
+                                    arr.iter().find_map(|opt| {
+                                        let kind = opt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                                        let opt_id = opt.get("optionId").and_then(|id| id.as_str())?;
+                                        if kind == "allow_once" || opt_id == "once" {
+                                            Some(opt_id.to_string())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                            })
+                            .unwrap_or_else(|| "always".to_string());
+
+                        let reply = json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": {
+                                "outcome": {
+                                    "outcome": "selected",
+                                    "optionId": option_id
+                                }
+                            }
+                        });
+                        self.stdin.write_all(format!("{}\n", reply).as_bytes()).await?;
+                        self.stdin.flush().await?;
+                        eprintln!("[ACP request_permission auto-approved] id={:?} optionId={}", req_id, option_id);
+                        continue;
+                    }
+                }
+
+                // Filter notifications: if line contains a sessionId, verify it matches current_session_id!
+                if let Some(sid) = v.pointer("/params/sessionId")
+                    .or_else(|| v.pointer("/params/update/sessionId"))
+                    .and_then(|s| s.as_str())
+                {
+                    if sid != current_session_id {
+                        continue;
+                    }
+                }
+
                 let update_type = v.pointer("/params/update/sessionUpdate").and_then(|u| u.as_str());
                 if update_type == Some("agent_thought_chunk") {
                     if let Some(thought) = v
@@ -382,20 +442,29 @@ impl AcpSession {
                 }
 
                 if let Some(err) = v.get("error") {
-                    eprintln!(">>> ACP RPC ERROR: {:?}", err);
-                    prompt_err = Some(err.clone());
+                    if v.get("id").and_then(|id| id.as_u64()) == Some(prompt_call_id) {
+                        eprintln!(">>> ACP RPC ERROR for prompt id {}: {:?}", prompt_call_id, err);
+                        prompt_err = Some(err.clone());
+                    } else {
+                        eprintln!(">>> ACP RPC ERROR ignoring mismatched id {:?} (expected {}): {:?}", v.get("id"), prompt_call_id, err);
+                    }
                 }
 
                 // Check stop conditions
-                let is_stop = v.pointer("/result/stopReason").is_some()
-                    || v.pointer("/params/update/stopReason").is_some()
+                let is_matching_result = v.get("id").and_then(|id| id.as_u64()) == Some(prompt_call_id);
+                let is_stop_notification = v.pointer("/params/update/stopReason").is_some()
                     || v.pointer("/params/stopReason").is_some()
                     || update_type == Some("turn_end");
+                let is_stop_result = is_matching_result
+                    && (v.pointer("/result/stopReason").is_some()
+                        || v.get("result").is_some()
+                        || v.get("error").is_some());
 
-                let is_matching_result = v.get("id").and_then(|id| id.as_u64()) == Some(prompt_call_id);
-
-                if is_stop || (is_matching_result && (v.get("result").is_some() || v.get("error").is_some())) {
-                    eprintln!("[ACP prompt broke] is_stop={} is_matching_result={}", is_stop, is_matching_result);
+                if is_stop_notification || is_stop_result {
+                    eprintln!(
+                        "[ACP prompt broke] is_stop_notification={} is_stop_result={}",
+                        is_stop_notification, is_stop_result
+                    );
                     break;
                 }
             }
@@ -472,7 +541,8 @@ impl SessionManager {
 
         // 1. Try to find an existing idle worker without spawning
         {
-            let lock = self.sessions.lock().await;
+            let mut lock = self.sessions.lock().await;
+            let mut dead_keys = Vec::new();
             for worker_idx in 0..4 {
                 let full_key = if worker_idx == 0 {
                     base_key.clone()
@@ -481,16 +551,27 @@ impl SessionManager {
                 };
 
                 if let Some((_, existing)) = lock.get(&full_key) {
-                    if let Ok(mut session_lock) = existing.try_lock() {
-                        match session_lock.child.try_wait() {
-                            Ok(None) => {
-                                drop(session_lock);
-                                return Ok(existing.clone());
-                            }
-                            _ => {}
+                    let (is_alive, is_dead) = match existing.try_lock() {
+                        Ok(mut session_lock) => match session_lock.child.try_wait() {
+                            Ok(None) => (Some(existing.clone()), false),
+                            _ => (None, true),
+                        },
+                        Err(_) => (None, false),
+                    };
+
+                    if let Some(found) = is_alive {
+                        for dk in dead_keys {
+                            lock.remove(&dk);
                         }
+                        return Ok(found);
+                    }
+                    if is_dead {
+                        dead_keys.push(full_key);
                     }
                 }
+            }
+            for dk in dead_keys {
+                lock.remove(&dk);
             }
         }
 
@@ -520,10 +601,14 @@ impl SessionManager {
         let mut lock = self.sessions.lock().await;
         let mut to_remove = Vec::new();
 
-        for (k, (_pid, sess)) in lock.iter() {
+        for (k, (pid, sess)) in lock.iter() {
             if let Ok(mut s) = sess.try_lock() {
                 if s.last_used.elapsed() > max_idle {
                     let _ = s.child.kill().await;
+                    let _ = s.child.wait().await;
+                    if let Some(p) = pid {
+                        let _ = tokio::process::Command::new("kill").args(["-9", &p.to_string()]).output().await;
+                    }
                     to_remove.push(k.clone());
                 }
             }
@@ -544,6 +629,7 @@ impl SessionManager {
             if k == &base_prefix || k.starts_with(&format!("{}:", base_prefix)) {
                 if let Ok(mut s) = sess.try_lock() {
                     let _ = s.child.kill().await;
+                    let _ = s.child.wait().await;
                 }
                 if let Some(p) = pid {
                     let _ = tokio::process::Command::new("kill").args(["-9", &p.to_string()]).output().await;

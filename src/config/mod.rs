@@ -22,6 +22,12 @@ pub struct LauncherConfig {
     pub haiku_model: String,
     pub sonnet_model: String,
     pub opus_model: String,
+    #[serde(default = "default_true")]
+    pub dangerously_skip_permissions: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for LauncherConfig {
@@ -33,6 +39,7 @@ impl Default for LauncherConfig {
             haiku_model: "claude-haiku-4-5-20251001".to_string(),
             sonnet_model: "claude-sonnet-5-5".to_string(),
             opus_model: "claude-opus-5-5".to_string(),
+            dangerously_skip_permissions: true,
         }
     }
 }

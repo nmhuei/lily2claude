@@ -2,7 +2,8 @@ use lily2claude::protocol::stream::SseStreamTranslator;
 
 #[test]
 fn test_sse_stream_state_machine_and_casing() {
-    let mut translator = SseStreamTranslator::new("msg_live_01", "deepseek-v4.1-flash");
+    let mut translator = SseStreamTranslator::new("msg_live_01", "deepseek-v4.1-flash")
+        .with_stream_thinking_as_text(false);
     translator.register_tool_casing("Bash");
 
     // Chunk 1: Reasoning
@@ -19,9 +20,46 @@ fn test_sse_stream_state_machine_and_casing() {
     let c3 = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
     let ev3 = translator.feed_chunk(c3);
     assert!(ev3.iter().any(|e| e.event == "content_block_start" && e.data["content_block"]["name"] == "Bash")); // Restores PascalCase!
-    assert!(ev3.iter().any(|e| e.event == "content_block_delta" && e.data["delta"]["partial_json"].as_str().unwrap().contains("ls -la")));
+    assert!(ev3.iter().any(|e| e.event == "content_block_delta" && e.data["delta"].get("partial_json").and_then(|v| v.as_str()).map(|s| s.contains("ls -la")).unwrap_or(false)));
+    assert!(ev3.iter().any(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"));
     assert!(ev3.iter().any(|e| e.event == "message_delta" && e.data["delta"]["stop_reason"] == "tool_use"));
     assert!(ev3.iter().any(|e| e.event == "message_stop"));
+}
+
+#[test]
+fn test_sse_stream_thinking_as_text() {
+    let mut translator = SseStreamTranslator::new("msg_live_think_text", "deepseek-v4.1-flash")
+        .with_stream_thinking_as_text(true);
+
+    // Chunk 1: Reasoning
+    let c1 = r#"{"choices":[{"delta":{"reasoning_content":"analyzing problem"}}]}"#;
+    let ev1 = translator.feed_chunk(c1);
+    assert!(ev1.iter().any(|e| e.event == "message_start"));
+    assert!(ev1.iter().any(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "text"));
+    assert!(ev1.iter().any(|e| {
+        e.event == "content_block_delta"
+            && e.data["delta"]["type"] == "text_delta"
+            && e.data["delta"]["text"].as_str().unwrap_or("").contains("💭 Thinking:\n")
+    }));
+    assert!(ev1.iter().any(|e| {
+        e.event == "content_block_delta"
+            && e.data["delta"]["type"] == "text_delta"
+            && e.data["delta"]["text"].as_str().unwrap_or("").contains("analyzing problem")
+    }));
+
+    // Chunk 2: Normal content
+    let c2 = r#"{"choices":[{"delta":{"content":"Found solution."}}]}"#;
+    let ev2 = translator.feed_chunk(c2);
+    assert!(ev2.iter().any(|e| {
+        e.event == "content_block_delta"
+            && e.data["delta"]["type"] == "text_delta"
+            && e.data["delta"]["text"].as_str().unwrap_or("").contains("💭 (Done thinking)")
+    }));
+    assert!(ev2.iter().any(|e| {
+        e.event == "content_block_delta"
+            && e.data["delta"]["type"] == "text_delta"
+            && e.data["delta"]["text"].as_str().unwrap_or("").contains("Found solution.")
+    }));
 }
 
 #[test]

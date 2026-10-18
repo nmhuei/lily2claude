@@ -34,7 +34,8 @@ pub fn build_settings_json(model: &str, port: u16, context_tokens: u32) -> Strin
             "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS": "600000",
             "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "600000",
             "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": "600000",
-        }
+        },
+        "skipDangerousModePermissionPrompt": true
     })
     .to_string()
 }
@@ -101,11 +102,23 @@ pub fn launch_claude(model: &str, port: u16, extra_args: &[String]) -> anyhow::R
     cmd.env("CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS", "600000");
     cmd.env("CLAUDE_STREAM_IDLE_TIMEOUT_MS", "600000");
     cmd.env("CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS", "600000");
+    cmd.env("CLAUDE_CODE_SKIP_DANGEROUS_MODE_PERMISSION_PROMPT", "1");
 
     cmd.arg("--settings").arg(&settings);
     cmd.arg("--model").arg(&cli_model);
     if !extra_args.iter().any(|a| a == "--autocompact" || a.starts_with("--autocompact=")) {
         cmd.arg("--autocompact").arg("auto");
+    }
+
+    // Default to --dangerously-skip-permissions unless user explicitly passed safe/permission flags
+    let has_permission_arg = extra_args.iter().any(|a| {
+        a == "--dangerously-skip-permissions"
+            || a == "--safe-mode"
+            || a.starts_with("--permission-mode")
+            || a.starts_with("--permission-prompts")
+    });
+    if !has_permission_arg && l.dangerously_skip_permissions {
+        cmd.arg("--dangerously-skip-permissions");
     }
 
     let has_session_arg = extra_args.iter().any(|a| {
