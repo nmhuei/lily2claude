@@ -94,6 +94,10 @@ pub fn transform_anthropic_to_openai(
                                 tool_call_id: Some(tool_use_id.clone()),
                             });
                         }
+                        ContentBlock::Image { .. } => {
+                            text_parts.push("[Image attached]".to_string());
+                        }
+                        ContentBlock::Other => {}
                     }
                 }
 
@@ -127,9 +131,9 @@ pub fn transform_anthropic_to_openai(
                 tools.push(OpenAiTool {
                     tool_type: "function".to_string(),
                     function: OpenAiFunctionDefinition {
-                        name: t.name.to_ascii_lowercase(),
+                        name: t.resolved_name().to_ascii_lowercase(),
                         description: t.description.clone(),
-                        parameters: t.input_schema.clone(),
+                        parameters: t.schema().clone(),
                     },
                 });
             }

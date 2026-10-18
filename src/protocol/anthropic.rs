@@ -82,9 +82,16 @@ pub enum SystemPrompt {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemBlock {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "default_text_type")]
     pub block_type: String,
+    #[serde(default)]
     pub text: String,
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, Value>,
+}
+
+fn default_text_type() -> String {
+    "text".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,28 +111,80 @@ pub enum AnthropicContent {
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        #[serde(default)]
+        text: String,
+    },
     #[serde(rename = "thinking")]
-    Thinking { thinking: String },
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
+        #[serde(default)]
         id: String,
+        #[serde(default)]
         name: String,
+        #[serde(default = "default_tool_input")]
         input: Value,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
+        #[serde(default)]
         tool_use_id: String,
+        #[serde(default)]
         content: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+    #[serde(rename = "image")]
+    Image {
+        #[serde(default)]
+        source: Value,
+    },
+    #[serde(other)]
+    Other,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn default_tool_input() -> Value {
+    serde_json::json!({})
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AnthropicTool {
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub tool_type: Option<String>,
+    #[serde(default)]
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default = "default_tool_schema")]
     pub input_schema: Value,
+}
+
+pub fn default_tool_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {}
+    })
+}
+
+impl AnthropicTool {
+    pub fn resolved_name(&self) -> &str {
+        if !self.name.is_empty() {
+            &self.name
+        } else if let Some(t) = &self.tool_type {
+            t.as_str()
+        } else {
+            "unknown_tool"
+        }
+    }
+
+    pub fn schema(&self) -> &Value {
+        if self.input_schema.get("properties").is_some() || self.input_schema.get("type").is_some() {
+            return &self.input_schema;
+        }
+        &self.input_schema
+    }
 }

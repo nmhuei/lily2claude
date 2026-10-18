@@ -37,6 +37,7 @@ fn test_strip_historic_thinking_blocks_and_sanitize() {
             name: "Bash".to_string(),
             description: Some("run bash".to_string()),
             input_schema: json!({"type": "object"}),
+            ..Default::default()
         }]),
         stream: true,
         max_tokens: 4096,
@@ -69,4 +70,32 @@ fn test_repair_tool_arguments() {
     let broken_json = "{\"command\": \"echo 'test'\",}";
     let fixed = repair_tool_arguments(broken_json);
     assert_eq!(fixed, "{\"command\": \"echo 'test'\"}");
+}
+
+#[test]
+fn test_web_search_tool_deserialization_without_input_schema() {
+    // Claude Code 2.1 web search tool payload without input_schema
+    let json_payload = r#"{
+        "model": "claude-sonnet-5-5",
+        "messages": [{"role": "user", "content": "search web"}],
+        "tools": [
+            {
+                "type": "web_search_20250305",
+                "name": "web_search"
+            },
+            {
+                "name": "Bash",
+                "description": "Run shell commands"
+            }
+        ]
+    }"#;
+
+    let req: MessagesRequest = serde_json::from_str(json_payload).expect("Must deserialize successfully without input_schema");
+    let tools = req.tools.expect("tools must be present");
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].resolved_name(), "web_search");
+    assert_eq!(tools[0].tool_type.as_deref(), Some("web_search_20250305"));
+    assert_eq!(tools[0].schema()["type"], "object");
+    assert_eq!(tools[1].resolved_name(), "Bash");
+    assert_eq!(tools[1].schema()["type"], "object");
 }

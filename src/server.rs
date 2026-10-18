@@ -101,7 +101,7 @@ async fn messages_handler(
     let calculated_input_tokens = crate::protocol::tokens::TokenCalculator::count_request_tokens(&req) as u64;
     let is_compact = req.is_compaction_request();
 
-    let tools_summary: Vec<String> = req.tools.as_ref().map(|ts| ts.iter().map(|t| t.name.clone()).collect()).unwrap_or_default();
+    let tools_summary: Vec<String> = req.tools.as_ref().map(|ts| ts.iter().map(|t| t.resolved_name().to_string()).collect()).unwrap_or_default();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
 
     let last_preview = req.messages.last().map(|m| {
@@ -118,7 +118,9 @@ async fn messages_handler(
                     },
                     ContentBlock::Thinking { thinking, .. } => {
                         format!("thinking: {}", thinking)
-                    }
+                    },
+                    ContentBlock::Image { .. } => "[Image]".to_string(),
+                    ContentBlock::Other => "[Other]".to_string(),
                 }).collect::<Vec<_>>().join(" | ")
             }
         };
@@ -548,8 +550,8 @@ pub fn build_acp_prompt(req: &MessagesRequest) -> String {
                     "\n\n[Tools Instruction]\nYou can call tools to perform actions. To call a tool, you MUST format it as:\n<tool_call>\n{\"name\": \"<tool_name>\", \"arguments\": {<args>}}\n</tool_call>\n\nAvailable tools:\n",
                 );
                 for t in tools {
-                    let name = &t.name;
-                    match name.as_str() {
+                    let name = t.resolved_name();
+                    match name {
                         "Bash" | "bash" => tool_guide.push_str("- bash: {\"command\": \"<command>\"} (Run shell commands in current project directory. Required parameter: 'command').\n"),
                         "Read" | "read" => tool_guide.push_str("- read: {\"file_path\": \"<file_path>\"} (Read file contents from filesystem. Required parameter: 'file_path').\n"),
                         "Edit" | "edit" => tool_guide.push_str("- edit: {\"file_path\": \"<file_path>\", \"old_string\": \"<exact text to replace>\", \"new_string\": \"<replacement text>\"} (Replace exact string in file).\n"),
@@ -557,8 +559,8 @@ pub fn build_acp_prompt(req: &MessagesRequest) -> String {
                         "Glob" | "glob" => tool_guide.push_str("- glob: {\"pattern\": \"<glob_pattern>\"} (Find files matching pattern).\n"),
                         "Grep" | "grep" => tool_guide.push_str("- grep: {\"pattern\": \"<regex_pattern>\"} (Search file contents for pattern).\n"),
                         _ => {
-                            let props: Vec<String> = t
-                                .input_schema
+                            let schema = t.schema();
+                            let props: Vec<String> = schema
                                 .get("properties")
                                 .and_then(|p| p.as_object())
                                 .map(|obj| obj.keys().cloned().collect())
@@ -677,6 +679,10 @@ pub fn build_acp_prompt(req: &MessagesRequest) -> String {
                                 text_content.trim()
                             ));
                         }
+                        ContentBlock::Image { .. } => {
+                            block_parts.push("[Image attached]".to_string());
+                        }
+                        ContentBlock::Other => {}
                     }
                 }
                 if !block_parts.is_empty() {

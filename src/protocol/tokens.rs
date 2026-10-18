@@ -83,7 +83,7 @@ impl TokenCalculator {
     pub fn count_content_block(block: &ContentBlock) -> usize {
         match block {
             ContentBlock::Text { text } => Self::count_text(text),
-            ContentBlock::Thinking { thinking } => Self::count_text(thinking).saturating_add(4),
+            ContentBlock::Thinking { thinking, .. } => Self::count_text(thinking).saturating_add(4),
             ContentBlock::ToolUse { name, input, .. } => {
                 let name_tokens = Self::count_text(name);
                 let input_str = input.to_string();
@@ -100,18 +100,20 @@ impl TokenCalculator {
                 // 6 tokens for tool_result wrapping overhead
                 content_tokens.saturating_add(6)
             }
+            ContentBlock::Image { .. } => 1600,
+            ContentBlock::Other => 10,
         }
     }
 
     /// Calculate tokens for a single AnthropicTool definition
     pub fn count_tool(tool: &AnthropicTool) -> usize {
-        let name_tokens = Self::count_text(&tool.name);
+        let name_tokens = Self::count_text(tool.resolved_name());
         let desc_tokens = tool
             .description
             .as_deref()
             .map(Self::count_text)
             .unwrap_or(0);
-        let schema_str = tool.input_schema.to_string();
+        let schema_str = tool.schema().to_string();
         let schema_tokens = Self::count_text(&schema_str);
         // 12 tokens for function calling schema wrapper structure
         name_tokens

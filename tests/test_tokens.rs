@@ -45,6 +45,7 @@ fn test_token_calculator_request() {
                 },
                 "required": ["command"]
             }),
+            ..Default::default()
         }]),
         stream: true,
         max_tokens: 4096,

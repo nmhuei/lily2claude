@@ -22,6 +22,7 @@ fn test_build_acp_prompt_preserves_multiturn_tools_and_system() {
             name: "Bash".to_string(),
             description: Some("Execute a shell command".to_string()),
             input_schema: json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+            ..Default::default()
         }]),
         stream: true,
         max_tokens: 4096,
@@ -101,6 +102,7 @@ fn test_build_acp_prompt_compaction_truncates_and_injects_directive() {
             name: "Bash".to_string(),
             description: Some("Execute command".to_string()),
             input_schema: json!({}),
+            ..Default::default()
         }]),
         stream: true,
         max_tokens: 4096,
