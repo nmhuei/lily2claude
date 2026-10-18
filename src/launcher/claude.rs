@@ -99,8 +99,8 @@ pub fn launch_claude(model: &str, port: u16, extra_args: &[String]) -> anyhow::R
 
     cmd.arg("--settings").arg(&settings);
     cmd.arg("--model").arg(&cli_model);
-    if !extra_args.iter().any(|a| a == "--autocompact") {
-        cmd.arg("--autocompact");
+    if !extra_args.iter().any(|a| a == "--autocompact" || a.starts_with("--autocompact=")) {
+        cmd.arg("--autocompact").arg("auto");
     }
 
     let has_session_arg = extra_args.iter().any(|a| {
