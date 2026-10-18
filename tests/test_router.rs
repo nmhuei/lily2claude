@@ -33,3 +33,21 @@ fn test_router_resolves_claude_subagent_models_to_deepseek() {
         assert_eq!(candidates[0].model, "deepseek-v4.1-flash-free");
     }
 }
+
+#[test]
+fn test_circuit_breaker_prioritizes_healthy_candidates() {
+    let config = Config::load_default();
+    let router = EngineRouter::new(config);
+
+    // Initial state: opencode is primary
+    let c1 = router.resolve_alias("deepseek");
+    assert_eq!(c1[0].provider, "opencode");
+
+    // Trip circuit breaker for opencode
+    router.mark_provider_degraded("opencode", 120);
+
+    // Now healthy candidate (commandcode) must be promoted to the front immediately!
+    let c2 = router.resolve_alias("deepseek");
+    assert_eq!(c2[0].provider, "commandcode");
+    assert_eq!(c2.last().unwrap().provider, "opencode");
+}

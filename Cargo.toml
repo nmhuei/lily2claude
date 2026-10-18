@@ -23,6 +23,8 @@ bytes = "1"
 regex = "1.11"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 async-trait = "0.1.92"
+tiktoken-rs = "0.12.1"
+uuid = { version = "1.6", features = ["v4"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

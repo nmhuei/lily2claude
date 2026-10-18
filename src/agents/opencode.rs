@@ -49,12 +49,7 @@ impl Agent for OpenCodeAgent {
     }
 
     fn check_auth(&self) -> AuthStatus {
-        let path = Self::auth_path();
-        if path.exists() {
-            AuthStatus::Ready
-        } else {
-            AuthStatus::Missing(path.to_string_lossy().to_string())
-        }
+        AuthStatus::Ready
     }
 
     fn discover_models(&self) -> Vec<ModelMetadata> {
@@ -105,8 +100,8 @@ impl Agent for OpenCodeAgent {
         prompt: &str,
         session_key: Option<&str>,
         session_mgr: Option<&crate::engine::session::SessionManager>,
-        tx: mpsc::Sender<String>,
-    ) -> anyhow::Result<()> {
+        tx: mpsc::Sender<crate::protocol::tokens::AcpOutputChunk>,
+    ) -> anyhow::Result<crate::protocol::tokens::TokenUsage> {
         let clean_model = model.strip_prefix("opencode:").unwrap_or(model);
         let qualified_model = if clean_model.contains('/') {
             clean_model.to_string()
@@ -124,3 +119,4 @@ impl Agent for OpenCodeAgent {
         }
     }
 }
+

@@ -129,8 +129,8 @@ impl Agent for KiloAgent {
         prompt: &str,
         session_key: Option<&str>,
         session_mgr: Option<&crate::engine::session::SessionManager>,
-        tx: mpsc::Sender<String>,
-    ) -> anyhow::Result<()> {
+        tx: mpsc::Sender<crate::protocol::tokens::AcpOutputChunk>,
+    ) -> anyhow::Result<crate::protocol::tokens::TokenUsage> {
         let cmd = vec!["kilo".to_string(), "acp".to_string()];
         if let (Some(mgr), Some(key)) = (session_mgr, session_key) {
             let session = mgr.get_or_create(key, self.id(), &cmd).await?;
@@ -142,3 +142,4 @@ impl Agent for KiloAgent {
         }
     }
 }
+

@@ -75,8 +75,8 @@ impl Agent for GenericAcpAgent {
         prompt: &str,
         session_key: Option<&str>,
         session_mgr: Option<&crate::engine::session::SessionManager>,
-        tx: mpsc::Sender<String>,
-    ) -> anyhow::Result<()> {
+        tx: mpsc::Sender<crate::protocol::tokens::AcpOutputChunk>,
+    ) -> anyhow::Result<crate::protocol::tokens::TokenUsage> {
         let mut cmd = vec![self.binary.clone()];
         cmd.extend(self.args.clone());
         if let (Some(mgr), Some(key)) = (session_mgr, session_key) {
@@ -89,3 +89,4 @@ impl Agent for GenericAcpAgent {
         }
     }
 }
+

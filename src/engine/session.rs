@@ -64,20 +64,44 @@ pub fn extract_session_key_from_headers_or_req(
 pub struct AcpSession {
     pub session_id: String,
     pub child: Child,
+    pub child_pid: Option<u32>,
     pub stdin: ChildStdin,
     pub reader: Lines<BufReader<ChildStdout>>,
     pub last_used: Instant,
     pub rpc_id: u64,
+    pub warp_pool: Option<Arc<crate::config::warp_pool::WarpPool>>,
+    pub proxy_used: Option<String>,
 }
 
 impl AcpSession {
-    pub async fn spawn(command: &[String]) -> anyhow::Result<Self> {
-        let mut child = Command::new(&command[0])
-            .args(&command[1..])
+    pub async fn spawn(
+        command: &[String],
+        warp_pool: Option<Arc<crate::config::warp_pool::WarpPool>>,
+    ) -> anyhow::Result<Self> {
+        let mut cmd = Command::new(&command[0]);
+        cmd.args(&command[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+
+        let mut proxy_used = None;
+
+        // Isolate opencode data directory and inject WARP proxy if available
+        if command[0].contains("opencode") {
+            cmd.env("XDG_DATA_HOME", "/tmp/lily_opencode_data");
+
+            if let Some(ref pool) = warp_pool {
+                if let Some(proxy) = pool.acquire_proxy() {
+                    cmd.env("HTTP_PROXY", &proxy);
+                    cmd.env("HTTPS_PROXY", &proxy);
+                    cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
+                    proxy_used = Some(proxy);
+                }
+            }
+        }
+
+        let mut child = cmd.spawn()?;
+        let child_pid = child.id();
 
         let mut stdin = child.stdin.take().expect("Failed to open stdin");
         let stdout = child.stdout.take().expect("Failed to open stdout");
@@ -86,12 +110,14 @@ impl AcpSession {
         // Drain stderr concurrently to avoid deadlocks
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(_)) = lines.next_line().await {}
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("[ACP STDERR] {}", line);
+            }
         });
 
         let mut reader = BufReader::new(stdout).lines();
 
-        // 1. initialize
+        // 1. initialize with 10-second timeout to prevent deadlocks
         let init_req = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -104,33 +130,37 @@ impl AcpSession {
         });
         stdin.write_all(format!("{}\n", init_req).as_bytes()).await?;
         stdin.flush().await?;
-        let _init_resp = reader.next_line().await?;
 
-        // 2. session/new
-        let session_req = json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "session/new",
-            "params": {"cwd": std::env::current_dir()?.to_string_lossy(), "mcpServers": []}
-        });
-        stdin.write_all(format!("{}\n", session_req).as_bytes()).await?;
-        stdin.flush().await?;
+        let init_res = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(line) = reader.next_line().await? {
+                if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                    if val.get("id").and_then(|id| id.as_u64()) == Some(1) {
+                        return Ok(());
+                    }
+                }
+            }
+            anyhow::bail!("ACP reader closed during initialize handshake")
+        })
+        .await;
 
-        let session_resp = reader.next_line().await?.unwrap_or_default();
-        let session_val: Value = serde_json::from_str(&session_resp)?;
-        let session_id = session_val
-            .pointer("/result/sessionId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("s1")
-            .to_string();
+        match init_res {
+            Ok(Ok(())) => {},
+            _ => {
+                let _ = child.kill().await;
+                anyhow::bail!("ACP initialize handshake timed out or failed for {:?}", command);
+            }
+        }
 
         Ok(Self {
-            session_id,
+            session_id: "s_warm".to_string(),
             child,
+            child_pid,
             stdin,
             reader,
             last_used: Instant::now(),
-            rpc_id: 2,
+            rpc_id: 1,
+            warp_pool,
+            proxy_used,
         })
     }
 
@@ -138,18 +168,55 @@ impl AcpSession {
         &mut self,
         model: &str,
         prompt: &str,
-        tx: mpsc::Sender<String>,
-    ) -> anyhow::Result<()> {
+        tx: mpsc::Sender<crate::protocol::tokens::AcpOutputChunk>,
+    ) -> anyhow::Result<crate::protocol::tokens::TokenUsage> {
         self.last_used = Instant::now();
-        self.rpc_id += 1;
-        let call_id = self.rpc_id;
 
+        // 1. Create a fresh session for this turn to guarantee clean context
+        self.rpc_id += 1;
+        let session_call_id = self.rpc_id;
+        let cwd = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/home/light"))
+            .to_string_lossy()
+            .to_string();
+
+        let session_req = json!({
+            "jsonrpc": "2.0",
+            "id": session_call_id,
+            "method": "session/new",
+            "params": {"cwd": cwd, "mcpServers": []}
+        });
+        self.stdin.write_all(format!("{}\n", session_req).as_bytes()).await?;
+        self.stdin.flush().await?;
+
+        let mut current_session_id = None;
+        while let Some(line) = self.reader.next_line().await? {
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                if v.get("id").and_then(|id| id.as_u64()) == Some(session_call_id) {
+                    if let Some(err) = v.get("error") {
+                        anyhow::bail!("ACP session/new failed: {:?}", err);
+                    }
+                    if let Some(sid) = v.pointer("/result/sessionId").and_then(|s| s.as_str()) {
+                        current_session_id = Some(sid.to_string());
+                    }
+                    break;
+                }
+            }
+        }
+
+        let current_session_id = current_session_id.ok_or_else(|| {
+            anyhow::anyhow!("Failed to acquire sessionId from ACP session/new")
+        })?;
+
+        // 2. session/prompt
+        self.rpc_id += 1;
+        let prompt_call_id = self.rpc_id;
         let prompt_req = json!({
             "jsonrpc": "2.0",
-            "id": call_id,
+            "id": prompt_call_id,
             "method": "session/prompt",
             "params": {
-                "sessionId": self.session_id,
+                "sessionId": current_session_id,
                 "model": model,
                 "prompt": [{"type": "text", "text": prompt}]
             }
@@ -157,11 +224,27 @@ impl AcpSession {
         self.stdin.write_all(format!("{}\n", prompt_req).as_bytes()).await?;
         self.stdin.flush().await?;
 
+        let mut captured_usage: Option<crate::protocol::tokens::TokenUsage> = None;
+        let mut prompt_err = None;
+
         while let Some(line) = self.reader.next_line().await? {
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
                 let update_type = v.pointer("/params/update/sessionUpdate").and_then(|u| u.as_str());
                 if update_type == Some("agent_thought_chunk") {
+                    if let Some(thought) = v
+                        .pointer("/params/update/content/text")
+                        .or_else(|| v.pointer("/params/update/content/0/text"))
+                        .and_then(|t| t.as_str())
+                    {
+                        if !thought.is_empty() {
+                            let _ = tx.send(crate::protocol::tokens::AcpOutputChunk::Thinking(thought.to_string())).await;
+                        }
+                    }
                     continue;
+                }
+
+                if let Some(usage) = crate::protocol::tokens::extract_acp_usage(&v) {
+                    captured_usage = Some(usage);
                 }
 
                 // Parse text chunks from either object or array
@@ -172,37 +255,136 @@ impl AcpSession {
                     .and_then(|t| t.as_str())
                 {
                     if !text.is_empty() {
-                        let _ = tx.send(text.to_string()).await;
+                        if text.contains("provider.quota")
+                            || text.contains("Rate limit exceeded")
+                            || text.contains("rate limit exceeded")
+                        {
+                            if let (Some(ref pool), Some(ref proxy)) = (&self.warp_pool, &self.proxy_used) {
+                                pool.mark_rate_limited(proxy, 300);
+                            }
+                            anyhow::bail!("ACP rate limited: {}", text);
+                        }
+                        let _ = tx.send(crate::protocol::tokens::AcpOutputChunk::Text(text.to_string())).await;
                     }
+                }
+
+                if update_type == Some("tool_call") {
+                    let input_val = v.pointer("/params/update/rawInput")
+                        .or_else(|| v.pointer("/params/update/input"))
+                        .unwrap_or(&serde_json::Value::Null);
+
+                    if input_val.is_null() || input_val.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                        // Skip intermediate empty updates
+                        continue;
+                    }
+
+                    let (tool_name, tool_input) = if let Some(kind) = v.pointer("/params/update/kind").and_then(|k| k.as_str()) {
+                        match kind.to_lowercase().as_str() {
+                            "bash" | "execute_bash" | "execute" => ("Bash".to_string(), input_val.clone()),
+                            "read" | "file_read" | "view" => ("Read".to_string(), input_val.clone()),
+                            "edit" | "file_edit" => ("Edit".to_string(), input_val.clone()),
+                            "write" | "file_write" => ("Write".to_string(), input_val.clone()),
+                            "ls" | "dir" | "list_directory" => {
+                                let path = input_val.get("path").or_else(|| input_val.get("directory")).and_then(|p| p.as_str()).unwrap_or(".");
+                                ("Bash".to_string(), serde_json::json!({"command": format!("ls -la {}", path)}))
+                            }
+                            "grep" | "search_files" => {
+                                let pat = input_val.get("pattern").or_else(|| input_val.get("query")).and_then(|p| p.as_str()).unwrap_or("");
+                                let path = input_val.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+                                ("Bash".to_string(), serde_json::json!({"command": format!("grep -rn '{}' {}", pat, path)}))
+                            }
+                            "glob" | "find_files" => {
+                                let pat = input_val.get("pattern").and_then(|p| p.as_str()).unwrap_or("*");
+                                let path = input_val.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+                                ("Bash".to_string(), serde_json::json!({"command": format!("find {} -name '{}'", path, pat)}))
+                            }
+                            _ => (kind.to_string(), input_val.clone()),
+                        }
+                    } else if let Some(title) = v.pointer("/params/update/title").and_then(|t| t.as_str()) {
+                        if title.to_lowercase().contains("bash") || title.to_lowercase().contains("shell") {
+                            ("Bash".to_string(), input_val.clone())
+                        } else {
+                            (title.to_string(), input_val.clone())
+                        }
+                    } else {
+                        ("Bash".to_string(), input_val.clone())
+                    };
+
+                    let tool_str = format!("\n<tool_call>\n{{\"name\": \"{}\", \"arguments\": {}}}\n</tool_call>\n", tool_name, tool_input);
+                    let _ = tx.send(crate::protocol::tokens::AcpOutputChunk::Text(tool_str)).await;
+                }
+
+                if let Some(err) = v.get("error") {
+                    eprintln!(">>> ACP RPC ERROR: {:?}", err);
+                    prompt_err = Some(err.clone());
                 }
 
                 // Check stop conditions
                 let is_stop = v.pointer("/result/stopReason").is_some()
                     || v.pointer("/params/update/stopReason").is_some()
-                    || v.pointer("/params/stopReason").is_some();
+                    || v.pointer("/params/stopReason").is_some()
+                    || update_type == Some("turn_end");
 
-                let is_matching_result = v.get("id").and_then(|id| id.as_u64()) == Some(call_id);
+                let is_matching_result = v.get("id").and_then(|id| id.as_u64()) == Some(prompt_call_id);
 
-                if is_stop || (is_matching_result && v.get("result").is_some()) {
+                if is_stop || (is_matching_result && (v.get("result").is_some() || v.get("error").is_some())) {
                     break;
                 }
             }
         }
 
-        Ok(())
+        if let Some(err) = prompt_err {
+            let err_str = err.to_string();
+            if err_str.contains("provider.quota")
+                || err_str.contains("Rate limit exceeded")
+                || err_str.contains("rate limit")
+                || err_str.contains("429")
+            {
+                if let (Some(ref pool), Some(ref proxy)) = (&self.warp_pool, &self.proxy_used) {
+                    pool.mark_rate_limited(proxy, 300);
+                }
+            }
+            anyhow::bail!("ACP session/prompt error: {:?}", err);
+        }
+
+        let final_usage = captured_usage.unwrap_or_default();
+        if final_usage.total() > 0 {
+            let _ = tx.send(crate::protocol::tokens::AcpOutputChunk::Usage(final_usage)).await;
+        }
+        Ok(final_usage)
     }
 }
 
-#[derive(Clone, Default)]
+
+#[derive(Clone)]
 pub struct SessionManager {
-    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<AcpSession>>>>>,
+    sessions: Arc<Mutex<HashMap<String, (Option<u32>, Arc<Mutex<AcpSession>>)>>>,
+    warp_pool: Option<Arc<crate::config::warp_pool::WarpPool>>,
+}
+
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            warp_pool: Some(Arc::new(crate::config::warp_pool::WarpPool::default_pool())),
         }
+    }
+
+    pub fn with_pool(warp_pool: Option<Arc<crate::config::warp_pool::WarpPool>>) -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            warp_pool,
+        }
+    }
+
+    pub fn warp_pool(&self) -> Option<Arc<crate::config::warp_pool::WarpPool>> {
+        self.warp_pool.clone()
     }
 
     pub async fn active_count(&self) -> usize {
@@ -217,49 +399,50 @@ impl SessionManager {
         command: &[String],
     ) -> anyhow::Result<Arc<Mutex<AcpSession>>> {
         let base_key = format!("{}:{}", provider, session_key);
-        let mut lock = self.sessions.lock().await;
 
-        // Try existing worker slots (base, worker_1, worker_2, worker_3) to enable parallel subagents
+        // 1. Try to find an existing idle worker without spawning
+        {
+            let lock = self.sessions.lock().await;
+            for worker_idx in 0..4 {
+                let full_key = if worker_idx == 0 {
+                    base_key.clone()
+                } else {
+                    format!("{}:worker_{}", base_key, worker_idx)
+                };
+
+                if let Some((_, existing)) = lock.get(&full_key) {
+                    if let Ok(mut session_lock) = existing.try_lock() {
+                        match session_lock.child.try_wait() {
+                            Ok(None) => {
+                                drop(session_lock);
+                                return Ok(existing.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Spawn new session OUTSIDE the lock to eliminate any possibility of deadlock
+        let new_session = AcpSession::spawn(command, self.warp_pool.clone()).await?;
+        let child_pid = new_session.child_pid;
+        let handle = Arc::new(Mutex::new(new_session));
+
+        // 3. Insert into sessions map with lock
+        let mut lock = self.sessions.lock().await;
         for worker_idx in 0..4 {
             let full_key = if worker_idx == 0 {
                 base_key.clone()
             } else {
                 format!("{}:worker_{}", base_key, worker_idx)
             };
-
-            if let Some(existing) = lock.get(&full_key) {
-                if let Ok(mut session_lock) = existing.try_lock() {
-                    match session_lock.child.try_wait() {
-                        Ok(None) => {
-                            // Still running and not currently busy!
-                            drop(session_lock);
-                            return Ok(existing.clone());
-                        }
-                        _ => {
-                            // Exited process, will spawn new one below
-                        }
-                    }
-                } else {
-                    // Session is busy executing another concurrent subagent turn! Try next worker slot!
-                    continue;
-                }
+            if !lock.contains_key(&full_key) {
+                lock.insert(full_key, (child_pid, handle.clone()));
+                return Ok(handle);
             }
-
-            // Spawn fresh session for this slot
-            let new_session = AcpSession::spawn(command).await?;
-            let handle = Arc::new(Mutex::new(new_session));
-            lock.insert(full_key, handle.clone());
-            return Ok(handle);
         }
-
-        // If all 4 workers are busy, return base handle and await lock
-        if let Some(existing) = lock.get(&base_key) {
-            return Ok(existing.clone());
-        }
-
-        let new_session = AcpSession::spawn(command).await?;
-        let handle = Arc::new(Mutex::new(new_session));
-        lock.insert(base_key, handle.clone());
+        lock.insert(base_key, (child_pid, handle.clone()));
         Ok(handle)
     }
 
@@ -267,10 +450,36 @@ impl SessionManager {
         let mut lock = self.sessions.lock().await;
         let mut to_remove = Vec::new();
 
-        for (k, sess) in lock.iter() {
-            let mut s = sess.lock().await;
-            if s.last_used.elapsed() > max_idle {
-                let _ = s.child.kill().await;
+        for (k, (pid, sess)) in lock.iter() {
+            if let Ok(mut s) = sess.try_lock() {
+                if s.last_used.elapsed() > max_idle {
+                    let _ = s.child.kill().await;
+                    to_remove.push(k.clone());
+                }
+            } else if let Some(p) = pid {
+                let _ = tokio::process::Command::new("kill").args(["-9", &p.to_string()]).output().await;
+                to_remove.push(k.clone());
+            }
+        }
+
+        for k in to_remove {
+            lock.remove(&k);
+        }
+    }
+
+    pub async fn evict_session(&self, session_key: &str, provider: &str) {
+        let base_prefix = format!("{}:{}", provider, session_key);
+        let mut lock = self.sessions.lock().await;
+        let mut to_remove = Vec::new();
+
+        for (k, (pid, sess)) in lock.iter() {
+            if k == &base_prefix || k.starts_with(&format!("{}:", base_prefix)) {
+                if let Ok(mut s) = sess.try_lock() {
+                    let _ = s.child.kill().await;
+                }
+                if let Some(p) = pid {
+                    let _ = tokio::process::Command::new("kill").args(["-9", &p.to_string()]).output().await;
+                }
                 to_remove.push(k.clone());
             }
         }

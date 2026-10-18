@@ -12,9 +12,10 @@ fn test_settings_json_generation() {
         val["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
         "200000"
     );
+    let cfg = lily2claude::config::Config::load();
     assert_eq!(
         val["env"]["CLAUDE_CODE_SUBAGENT_MODEL"],
-        "deepseek"
+        cfg.launcher.subagent_model
     );
     assert_eq!(
         val["env"]["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"],
@@ -22,6 +23,6 @@ fn test_settings_json_generation() {
     );
     assert_eq!(
         val["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
-        "deepseek"
+        cfg.launcher.haiku_model
     );
 }

@@ -57,4 +57,18 @@ pub enum Commands {
     /// Healthcheck Docker WARP nodes and local agents
     #[command(alias = "diagnose", alias = "check")]
     Doctor,
+    /// Display real-time token usage, cost ledger, and session statistics
+    #[command(alias = "usage", alias = "tokens")]
+    Stats {
+        /// Target port of the running lily2claude daemon
+        #[arg(short, long, default_value = "4001")]
+        port: u16,
+        /// Filter statistics for a specific session ID
+        #[arg(short, long)]
+        session: Option<String>,
+        /// Output raw JSON instead of human-friendly terminal report
+        #[arg(long)]
+        json: bool,
+    },
 }
+

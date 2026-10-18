@@ -25,10 +25,10 @@
 **Interfaces:**
 - Produces: `pub struct SessionManager`, `pub struct AcpSession`, `pub fn extract_session_key(req: &MessagesRequest) -> String`
 
-- [ ] **Step 1: Write unit test for session key derivation and session reuse**
-- [ ] **Step 2: Implement `src/engine/session.rs` with `AcpSession` and `SessionManager`**
-- [ ] **Step 3: Export in `src/engine/mod.rs` and `src/lib.rs`**
-- [ ] **Step 4: Run `cargo test --test test_session_sync` and verify pass**
+- [x] **Step 1: Write unit test for session key derivation and session reuse**
+- [x] **Step 2: Implement `src/engine/session.rs` with `AcpSession` and `SessionManager`**
+- [x] **Step 3: Export in `src/engine/mod.rs` and `src/lib.rs`**
+- [x] **Step 4: Run `cargo test --test test_session_sync` and verify pass**
 
 ---
 
@@ -46,10 +46,10 @@
 - Consumes: `SessionManager`
 - Produces: Persistent ACP session prompt execution
 
-- [ ] **Step 1: Update `Agent::execute_turn` signature to accept optional `session_key`**
-- [ ] **Step 2: Update `AcpClient` to support persistent session reuse via `SessionManager`**
-- [ ] **Step 3: Update `commandcode.rs`, `kilo.rs`, `cline.rs` to delegate to persistent session**
-- [ ] **Step 4: Verify with `cargo test --test test_session_sync`**
+- [x] **Step 1: Update `Agent::execute_turn` signature to accept optional `session_key`**
+- [x] **Step 2: Update `AcpClient` to support persistent session reuse via `SessionManager`**
+- [x] **Step 3: Update `commandcode.rs`, `kilo.rs`, `cline.rs` to delegate to persistent session**
+- [x] **Step 4: Verify with `cargo test --test test_session_sync`**
 
 ---
 
@@ -64,10 +64,10 @@
 - Consumes: `SessionManager`, `extract_session_key`
 - Produces: Consistent session routing across turns
 
-- [ ] **Step 1: Extract `session_key` in `messages_handler`**
-- [ ] **Step 2: Pass `session_key` to `agent.execute_turn` and `http_adapter.send_request`**
-- [ ] **Step 3: Set `x-opencode-session` header to `ses_{session_key}`**
-- [ ] **Step 4: Run full `cargo test` suite**
+- [x] **Step 1: Extract `session_key` in `messages_handler`**
+- [x] **Step 2: Pass `session_key` to `agent.execute_turn` and `http_adapter.send_request`**
+- [x] **Step 3: Set `x-opencode-session` header to `ses_{session_key}`**
+- [x] **Step 4: Run full `cargo test` suite**
 
 ---
 
@@ -77,8 +77,8 @@
 - Binary: `/home/light/GitHub/lily2claude/target/release/lily2claude`
 - Binary: `~/.local/bin/l2c`
 
-- [ ] **Step 1: Rebuild release binary and reinstall to `~/.local/bin/l2c`**
-- [ ] **Step 2: Restart daemon server (`l2c serve --port 4001`)**
-- [ ] **Step 3: Verify multi-turn context retention through real Claude Code interaction**
-- [ ] **Step 4: Commit all changes to git**
-- [ ] **Step 5: Conclude goal with `<!-- GOAL_COMPLETE -->`**
+- [x] **Step 1: Rebuild release binary and reinstall to `~/.local/bin/l2c`**
+- [x] **Step 2: Restart daemon server (`l2c serve --port 4001`)**
+- [x] **Step 3: Verify multi-turn context retention through real Claude Code interaction**
+- [x] **Step 4: Commit all changes to git**
+- [x] **Step 5: Conclude goal with `<!-- GOAL_COMPLETE -->`**

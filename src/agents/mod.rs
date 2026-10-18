@@ -72,6 +72,7 @@ pub trait Agent: Send + Sync {
         prompt: &str,
         session_key: Option<&str>,
         session_mgr: Option<&crate::engine::session::SessionManager>,
-        tx: mpsc::Sender<String>,
-    ) -> anyhow::Result<()>;
+        tx: mpsc::Sender<crate::protocol::tokens::AcpOutputChunk>,
+    ) -> anyhow::Result<crate::protocol::tokens::TokenUsage>;
 }
+

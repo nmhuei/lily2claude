@@ -15,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Commands::Serve { port, host }) => {
-            let config = Config::load_default();
+            let config = Config::load();
             let router = Arc::new(EngineRouter::new(config));
             let app = create_router(router);
             let addr = format!("{}:{}", host, port);
@@ -61,11 +61,93 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Doctor) => {
             run_doctor().await;
         }
+        Some(Commands::Stats { port, session, json }) => {
+            run_stats(port, session, json).await?;
+        }
         None => {
             // Default when running `l2c`: Launch Claude Code with default or passed model!
             launch_claude(&cli.model, cli.port, &cli.extra_args)?;
         }
     }
+    Ok(())
+}
+
+async fn run_stats(port: u16, session_filter: Option<String>, json_output: bool) -> anyhow::Result<()> {
+    let url = format!("http://127.0.0.1:{}/v1/stats", port);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()?;
+
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("\n❌ Could not connect to lily2claude daemon on port {}.", port);
+            eprintln!("   Make sure the server is running: `l2c serve --port {}`\n", port);
+            return Err(e.into());
+        }
+    };
+
+    if !resp.status().is_success() {
+        eprintln!("\n❌ Daemon returned error status: {}\n", resp.status());
+        return Ok(());
+    }
+
+    let stats: lily2claude::protocol::tokens::TokenStatsSummary = resp.json().await?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        return Ok(());
+    }
+
+    let hours = stats.uptime_seconds / 3600;
+    let mins = (stats.uptime_seconds % 3600) / 60;
+    let secs = stats.uptime_seconds % 60;
+
+    println!("\n📊 === Lily2Claude Token Usage & Performance Dashboard ===");
+    println!("  Server: {} v{} | Uptime: {}h {}m {}s | Total Requests: {}",
+        stats.service, stats.version, hours, mins, secs, stats.total_requests
+    );
+    println!("{:-<75}", "");
+    println!("📈 Cumulative Token Ledger:");
+    println!("  Input Tokens:        {:>10}", stats.cumulative.input_tokens);
+    println!("  Output Tokens:       {:>10}", stats.cumulative.output_tokens);
+    println!("  Cache Read Tokens:   {:>10}", stats.cumulative.cached_read_tokens);
+    println!("  Total Tokens:        {:>10}", stats.cumulative.total_tokens);
+    println!("{:-<75}", "");
+
+    // Models Table
+    println!("🤖 Model Consumption Breakdown:");
+    println!("{:<30} {:<10} {:<14} {:<14} {:<14}", "Model Name", "Requests", "Input", "Output", "Total");
+    println!("{:-<86}", "");
+    let mut model_list: Vec<_> = stats.models.values().collect();
+    model_list.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    for m in model_list {
+        println!("{:<30} {:<10} {:<14} {:<14} {:<14}",
+            m.model_name, m.request_count, m.input_tokens, m.output_tokens, m.total_tokens
+        );
+    }
+    println!("{:-<86}", "");
+
+    // Sessions Table
+    println!("🧵 Active Conversation Sessions ({} total):", stats.sessions.len());
+    println!("{:<38} {:<10} {:<12} {:<12} {:<12}", "Session ID", "Requests", "Input", "Output", "Total");
+    println!("{:-<88}", "");
+    let mut session_list: Vec<_> = stats.sessions.iter().filter(|s| {
+        if let Some(ref filter) = session_filter {
+            s.session_id.contains(filter)
+        } else {
+            true
+        }
+    }).collect();
+    session_list.sort_by(|a, b| b.last_activity_epoch_secs.cmp(&a.last_activity_epoch_secs));
+
+    for s in session_list {
+        println!("{:<38} {:<10} {:<12} {:<12} {:<12}",
+            s.session_id, s.request_count, s.input_tokens, s.output_tokens, s.total_tokens
+        );
+    }
+    println!("{:-<88}\n", "");
+
     Ok(())
 }
 

@@ -5,6 +5,48 @@ use crate::config::Config;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Default)]
+pub struct ProviderHealthRegistry {
+    tripped_until: Arc<Mutex<HashMap<String, Instant>>>,
+}
+
+impl ProviderHealthRegistry {
+    pub fn new() -> Self {
+        Self {
+            tripped_until: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn mark_failed(&self, provider: &str, cooldown_secs: u64) {
+        let mut map = self.tripped_until.lock().unwrap();
+        map.insert(provider.to_string(), Instant::now() + Duration::from_secs(cooldown_secs));
+    }
+
+    pub fn is_healthy(&self, provider: &str) -> bool {
+        let mut map = self.tripped_until.lock().unwrap();
+        let now = Instant::now();
+        map.retain(|_, expiry| *expiry > now);
+        !map.contains_key(provider)
+    }
+
+    pub fn prioritize_candidates(&self, candidates: Vec<TargetCandidate>) -> Vec<TargetCandidate> {
+        let mut healthy = Vec::new();
+        let mut degraded = Vec::new();
+        for c in candidates {
+            if self.is_healthy(&c.provider) {
+                healthy.push(c);
+            } else {
+                degraded.push(c);
+            }
+        }
+        healthy.extend(degraded);
+        healthy
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TargetCandidate {
     pub provider: String,
@@ -15,6 +57,7 @@ pub struct EngineRouter {
     config: Config,
     http_adapters: HashMap<String, Arc<HttpUpstreamAdapter>>,
     acp_adapters: HashMap<String, Arc<AcpClient>>,
+    health: ProviderHealthRegistry,
 }
 
 impl EngineRouter {
@@ -56,75 +99,127 @@ impl EngineRouter {
             config,
             http_adapters,
             acp_adapters,
+            health: ProviderHealthRegistry::new(),
         }
     }
 
-    fn parse_targets(targets: &[String]) -> Vec<TargetCandidate> {
-        targets
-            .iter()
-            .filter_map(|t| {
+    pub fn mark_provider_degraded(&self, provider: &str, cooldown_secs: u64) {
+        self.health.mark_failed(provider, cooldown_secs);
+    }
+
+    fn resolve_targets(&self, targets: &[String], depth: usize) -> Vec<TargetCandidate> {
+        if depth > 5 {
+            return Vec::new();
+        }
+        let mut candidates = Vec::new();
+        for t in targets {
+            if t.contains(':') {
                 let parts: Vec<&str> = t.splitn(2, ':').collect();
                 if parts.len() == 2 {
-                    Some(TargetCandidate {
+                    candidates.push(TargetCandidate {
                         provider: parts[0].to_string(),
                         model: parts[1].to_string(),
-                    })
-                } else {
-                    None
+                    });
                 }
-            })
-            .collect()
+            } else if let Some(sub_targets) = self.config.aliases.get(t) {
+                candidates.extend(self.resolve_targets(sub_targets, depth + 1));
+            }
+        }
+        candidates
     }
 
     pub fn resolve_alias(&self, alias: &str) -> Vec<TargetCandidate> {
+        let raw = self.resolve_alias_raw(alias);
+        self.health.prioritize_candidates(raw)
+    }
+
+    pub fn resolve_alias_raw(&self, alias: &str) -> Vec<TargetCandidate> {
         let clean = alias.trim().to_lowercase();
 
         // 1. Direct alias match
         if let Some(targets) = self.config.aliases.get(alias) {
-            return Self::parse_targets(targets);
+            let res = self.resolve_targets(targets, 0);
+            if !res.is_empty() {
+                return res;
+            }
         }
         if let Some(targets) = self.config.aliases.get(&clean) {
-            return Self::parse_targets(targets);
+            let res = self.resolve_targets(targets, 0);
+            if !res.is_empty() {
+                return res;
+            }
         }
 
-        // 2. Claude / Anthropic subagent model names -> transparently map to DeepSeek V4.1 Flash
+        // 2. Claude / Anthropic subagent model names -> transparently map to default target
         if clean.contains("claude")
             || clean.contains("haiku")
             || clean.contains("sonnet")
             || clean.contains("opus")
+            || clean.contains("fable")
             || clean.contains("anthropic")
+            || clean.contains("subagent")
+            || clean.contains("explore")
+            || clean.contains("general")
+            || clean.contains("plan")
+            || clean.contains("fast")
+            || clean.contains("small")
+            || clean.contains("auto")
             || clean == "default"
             || clean.is_empty()
         {
+            if let Some(targets) = self.config.aliases.get(&self.config.default_target) {
+                let res = self.resolve_targets(targets, 0);
+                if !res.is_empty() {
+                    return res;
+                }
+            }
             if let Some(targets) = self.config.aliases.get("deepseek") {
-                return Self::parse_targets(targets);
+                let res = self.resolve_targets(targets, 0);
+                if !res.is_empty() {
+                    return res;
+                }
             }
         }
 
         // 3. Family fuzzy matching
         if clean.contains("deepseek") {
             if let Some(targets) = self.config.aliases.get("deepseek") {
-                return Self::parse_targets(targets);
+                let res = self.resolve_targets(targets, 0);
+                if !res.is_empty() {
+                    return res;
+                }
             }
         }
         if clean.contains("glm") {
             if let Some(targets) = self.config.aliases.get("glm") {
-                return Self::parse_targets(targets);
+                let res = self.resolve_targets(targets, 0);
+                if !res.is_empty() {
+                    return res;
+                }
             }
         }
         if clean.contains("nemotron") {
             if let Some(targets) = self.config.aliases.get("nemotron") {
-                return Self::parse_targets(targets);
+                let res = self.resolve_targets(targets, 0);
+                if !res.is_empty() {
+                    return res;
+                }
             }
         }
         if clean.contains("mimo") {
             if let Some(targets) = self.config.aliases.get("mimo") {
-                return Self::parse_targets(targets);
+                let res = self.resolve_targets(targets, 0);
+                if !res.is_empty() {
+                    return res;
+                }
             }
         }
         if clean.contains("kilo") {
             if let Some(targets) = self.config.aliases.get("kilo") {
-                return Self::parse_targets(targets);
+                let res = self.resolve_targets(targets, 0);
+                if !res.is_empty() {
+                    return res;
+                }
             }
         }
 
@@ -137,7 +232,7 @@ impl EngineRouter {
                     model: parts[1].to_string(),
                 }];
                 if let Some(ds) = self.config.aliases.get("deepseek") {
-                    res.extend(Self::parse_targets(ds));
+                    res.extend(self.resolve_targets(ds, 0));
                 }
                 return res;
             }
@@ -149,7 +244,7 @@ impl EngineRouter {
             model: alias.to_string(),
         }];
         if let Some(ds) = self.config.aliases.get("deepseek") {
-            candidates.extend(Self::parse_targets(ds));
+            candidates.extend(self.resolve_targets(ds, 0));
         }
         candidates
     }
