@@ -439,6 +439,24 @@ async fn messages_handler(
                     }
                 }
 
+                let exec_res = exec_task.await;
+                let is_turn_ok = match &exec_res {
+                    Ok(Ok(_)) => true,
+                    _ => false,
+                };
+
+                if !is_turn_ok {
+                    eprintln!(">>> EXECUTE_TURN FAILED: {:?}. Emitting API error event instead of fake end_turn.", exec_res);
+                    let _ = sse_tx.send(Ok(Event::default().event("error").data(serde_json::json!({
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": "Upstream inference error. Retrying..."
+                        }
+                    }).to_string()))).await;
+                    return;
+                }
+
                 let final_input = captured_usage
                     .map(|u| u.input_tokens)
                     .unwrap_or(calculated_input_tokens);

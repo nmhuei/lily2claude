@@ -110,9 +110,31 @@ impl Agent for OpenCodeAgent {
         };
         let cmd = vec!["opencode".to_string(), "acp".to_string()];
         if let (Some(mgr), Some(key)) = (session_mgr, session_key) {
-            let session = mgr.get_or_create(key, self.id(), &cmd).await?;
-            let mut lock = session.lock().await;
-            lock.send_prompt(&qualified_model, prompt, tx).await
+            let mut last_err = None;
+            for attempt in 0..2 {
+                let session = mgr.get_or_create(key, self.id(), &cmd).await?;
+                let mut lock = session.lock().await;
+                match lock.send_prompt(&qualified_model, prompt, tx.clone()).await {
+                    Ok(usage) => return Ok(usage),
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        eprintln!("[OpenCode execute_turn] attempt {} failed: {}", attempt, err_str);
+                        if err_str.contains("provider.invalid-output")
+                            || err_str.contains("-32603")
+                            || err_str.contains("OpenAI Chat tool call delta is missing id or name")
+                        {
+                            last_err = Some(e);
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            if let Some(e) = last_err {
+                return Err(e);
+            }
+            anyhow::bail!("OpenCode turn failed after retries")
         } else {
             let client = AcpClient::new(cmd);
             client.run_prompt(&qualified_model, prompt, tx).await
