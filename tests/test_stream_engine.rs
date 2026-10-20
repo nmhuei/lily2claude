@@ -284,6 +284,31 @@ fn test_upstream_max_tokens_is_preserved() {
 }
 
 #[test]
+fn test_parallel_tool_calls_in_same_turn() {
+    let mut engine = AnthropicStreamEngine::new("msg_parallel", "deepseek", 100, HashMap::new())
+        .with_tools(&[bash_tool()]);
+
+    let stream_chunk = r#"
+<tool_call>
+{"name": "Bash", "arguments": {"command": "echo 1"}}
+</tool_call>
+<tool_call>
+{"name": "Bash", "arguments": {"command": "echo 2"}}
+</tool_call>
+"#;
+    let ev1 = engine.feed_text(stream_chunk);
+    let tools = logical_tools(&ev1);
+    assert_eq!(tools.len(), 2, "Both parallel tool calls must be captured in the same turn");
+    assert_eq!(tools[0].0, "Bash");
+    assert_eq!(tools[0].1["command"], "echo 1");
+    assert_eq!(tools[1].0, "Bash");
+    assert_eq!(tools[1].1["command"], "echo 2");
+
+    let tail = engine.finish(100, 20, 0);
+    assert_eq!(stop_reason(&tail).as_deref(), Some("tool_use"));
+}
+
+#[test]
 fn test_finish_is_idempotent() {
     let mut engine = AnthropicStreamEngine::new("msg_idem", "deepseek", 10, HashMap::new());
     let _ = engine.feed_text("hello");

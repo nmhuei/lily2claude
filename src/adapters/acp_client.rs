@@ -1,6 +1,7 @@
 use crate::protocol::tokens::{extract_acp_usage, AcpOutputChunk, TokenUsage};
 use serde_json::{json, Value};
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -32,14 +33,52 @@ impl AcpClient {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        // Isolate opencode data directory
+        // Isolate opencode data directory, but preserve existing auth token so the provider
+        // doesn't fail with "Authentication required".
         if self.command[0].contains("opencode") {
+            let data_dir = std::path::Path::new("/tmp/lily_opencode_data");
+            let opencode_dir = data_dir.join("opencode");
+            let _ = std::fs::create_dir_all(&opencode_dir);
+            let src_auth = crate::agents::opencode::OpenCodeAgent::auth_path();
+            let dst_auth = opencode_dir.join("auth.json");
+            if src_auth.exists()
+                && (!dst_auth.exists()
+                    || std::fs::metadata(&src_auth).map(|m| m.len()).unwrap_or(0)
+                        != std::fs::metadata(&dst_auth).map(|m| m.len()).unwrap_or(0))
+            {
+                let _ = std::fs::copy(&src_auth, &dst_auth);
+            }
             cmd.env("XDG_DATA_HOME", "/tmp/lily_opencode_data");
 
-            if let Ok(proxy) = std::env::var("L2C_PROXY") {
-                cmd.env("HTTP_PROXY", &proxy);
-                cmd.env("HTTPS_PROXY", &proxy);
+            let proxy = if let Ok(p) = std::env::var("L2C_PROXY") {
+                Some(p)
+            } else if std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], 40001)),
+                std::time::Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                Some("http://127.0.0.1:40001".to_string())
+            } else if std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], 40002)),
+                std::time::Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                Some("http://127.0.0.1:40002".to_string())
+            } else {
+                None
+            };
+
+            if let Some(p) = proxy {
+                cmd.env("HTTP_PROXY", &p);
+                cmd.env("HTTPS_PROXY", &p);
+                cmd.env("ALL_PROXY", &p);
+                cmd.env("http_proxy", &p);
+                cmd.env("https_proxy", &p);
+                cmd.env("all_proxy", &p);
                 cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
+                cmd.env("no_proxy", "localhost,127.0.0.1,::1");
             }
         }
 
@@ -191,7 +230,68 @@ impl AcpClient {
         let mut captured_usage: Option<TokenUsage> = None;
         let mut prompt_err = None;
 
-        while let Some(line) = reader.next_line().await? {
+        let mut seen_tool_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut emitted_tool_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        loop {
+            let next_line_future = reader.next_line();
+            let line_opt = if !emitted_tool_calls.is_empty() && emitted_tool_calls.len() >= seen_tool_calls.len() {
+                // All announced tool calls have been emitted to Claude Code.
+                // Wait with a short 250ms debounce window to catch any additional
+                // parallel tool calls before concluding this turn.
+                match tokio::time::timeout(Duration::from_millis(250), next_line_future).await {
+                    Ok(res) => res?,
+                    Err(_) => {
+                        if is_debug {
+                            eprintln!(
+                                "[AcpClient tool_call debounce] 250ms window elapsed. Drained {} tools.",
+                                emitted_tool_calls.len()
+                            );
+                        }
+                        let cancel_req = json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/cancel",
+                            "params": {
+                                "sessionId": session_id
+                            }
+                        });
+                        let _ = stdin.write_all(format!("{}\n", cancel_req).as_bytes()).await;
+                        let _ = stdin.flush().await;
+                        break;
+                    }
+                }
+            } else if !emitted_tool_calls.is_empty() {
+                // There are still announced tool calls waiting for their argument updates.
+                // Wait up to 1500ms for arguments to arrive.
+                match tokio::time::timeout(Duration::from_millis(1500), next_line_future).await {
+                    Ok(res) => res?,
+                    Err(_) => {
+                        if is_debug {
+                            eprintln!(
+                                "[AcpClient tool_call debounce] Timed out waiting for arguments of pending tool calls. Drained {} tools.",
+                                emitted_tool_calls.len()
+                            );
+                        }
+                        let cancel_req = json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/cancel",
+                            "params": {
+                                "sessionId": session_id
+                            }
+                        });
+                        let _ = stdin.write_all(format!("{}\n", cancel_req).as_bytes()).await;
+                        let _ = stdin.flush().await;
+                        break;
+                    }
+                }
+            } else {
+                next_line_future.await?
+            };
+
+            let Some(line) = line_opt else {
+                break;
+            };
+
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
                 // Reject internal ACP tool execution: OpenCode is purely an LLM inference provider,
                 // and all tool execution belongs strictly to the Claude Code harness.
@@ -210,6 +310,18 @@ impl AcpClient {
                         stdin.flush().await?;
                         if is_debug {
                             eprintln!("[ACP request_permission rejected for internal tool execution] id={:?}", req_id);
+                        }
+                        if !emitted_tool_calls.is_empty() {
+                            let cancel_req = json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/cancel",
+                                "params": {
+                                    "sessionId": session_id
+                                }
+                            });
+                            let _ = stdin.write_all(format!("{}\n", cancel_req).as_bytes()).await;
+                            let _ = stdin.flush().await;
+                            break;
                         }
                         continue;
                     }
@@ -255,7 +367,37 @@ impl AcpClient {
                     }
                 }
 
+                // Post-tool boundary guard: if tools have already been emitted and OpenCode moves on
+                // to agent text or completion, conclude the turn.
+                if !emitted_tool_calls.is_empty() && (update_type == Some("agent_message_chunk") || update_type == Some("completed")) {
+                    if is_debug {
+                        eprintln!("[AcpClient tool_call drain] Post-tool chunk arrived (update={:?}) - concluding turn", update_type);
+                    }
+                    let cancel_req = json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/cancel",
+                        "params": {
+                            "sessionId": session_id
+                        }
+                    });
+                    let _ = stdin.write_all(format!("{}\n", cancel_req).as_bytes()).await;
+                    let _ = stdin.flush().await;
+                    break;
+                }
+
                 if update_type == Some("tool_call") || update_type == Some("tool_call_update") {
+                    let call_id = v.pointer("/params/update/toolCallId")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("");
+
+                    if !call_id.is_empty() {
+                        seen_tool_calls.insert(call_id.to_string());
+                    }
+
+                    if !call_id.is_empty() && emitted_tool_calls.contains(call_id) {
+                        continue;
+                    }
+
                     let raw_name = v.pointer("/params/update/name")
                         .or_else(|| v.pointer("/params/update/title"))
                         .and_then(|n| n.as_str())
@@ -346,22 +488,24 @@ impl AcpClient {
                         _ => true,
                     };
 
-                    if is_ready {
-                        let tool_str = format!("\n<tool_call>\n{{\"name\": \"{}\", \"arguments\": {}}}\n</tool_call>\n", tool_name, tool_input);
-                        let _ = tx.send(AcpOutputChunk::Text(tool_str)).await;
-
-                        if is_debug {
-                            eprintln!("[AcpClient tool_call guard] Intercepted tool call '{}' - delegating to Claude Code", tool_name);
-                        }
-                        let cancel_req = json!({
-                            "jsonrpc": "2.0",
-                            "method": "session/cancel",
-                            "params": { "sessionId": session_id }
-                        });
-                        let _ = stdin.write_all(format!("{}\n", cancel_req).as_bytes()).await;
-                        let _ = stdin.flush().await;
-                        break;
+                    if !is_ready {
+                        continue;
                     }
+
+                    if !call_id.is_empty() {
+                        emitted_tool_calls.insert(call_id.to_string());
+                    }
+
+                    let tool_str = format!("\n<tool_call>\n{{\"name\": \"{}\", \"arguments\": {}}}\n</tool_call>\n", tool_name, tool_input);
+                    let _ = tx.send(AcpOutputChunk::Text(tool_str)).await;
+
+                    if is_debug {
+                        eprintln!(
+                            "[AcpClient tool_call guard] Intercepted tool call '{}' (id={}) - delegated to Claude Code (emitted: {}/{})",
+                            tool_name, call_id, emitted_tool_calls.len(), seen_tool_calls.len()
+                        );
+                    }
+                    continue;
                 }
 
                 if let Some(err) = v.get("error") {
@@ -392,6 +536,17 @@ impl AcpClient {
                         || v.get("error").is_some());
 
                 if is_stop_notification || is_stop_result {
+                    if !emitted_tool_calls.is_empty() {
+                        let cancel_req = json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/cancel",
+                            "params": {
+                                "sessionId": session_id
+                            }
+                        });
+                        let _ = stdin.write_all(format!("{}\n", cancel_req).as_bytes()).await;
+                        let _ = stdin.flush().await;
+                    }
                     break;
                 }
             }

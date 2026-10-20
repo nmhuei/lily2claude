@@ -20,8 +20,15 @@ impl Default for SessionManager {
 
 impl SessionManager {
     pub fn new() -> Self {
-        let warp_pool = if std::env::var_os("L2C_ENABLE_WARP").is_some() {
-            Some(Arc::new(crate::config::warp_pool::WarpPool::default_pool()))
+        let warp_pool = if std::env::var_os("L2C_DISABLE_WARP").is_none() {
+            let config = crate::config::Config::load();
+            if config.warp.require_warp || !config.warp.nodes.is_empty() {
+                Some(Arc::new(crate::config::warp_pool::WarpPool::from_config(
+                    &config.warp,
+                )))
+            } else {
+                None
+            }
         } else {
             None
         };
