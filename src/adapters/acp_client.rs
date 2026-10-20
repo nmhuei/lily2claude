@@ -255,6 +255,83 @@ impl AcpClient {
                     }
                 }
 
+                if update_type == Some("tool_call") || update_type == Some("tool_call_update") {
+                    let input_val = v.pointer("/params/update/rawInput")
+                        .or_else(|| v.pointer("/params/update/input"))
+                        .unwrap_or(&serde_json::Value::Null);
+
+                    if !input_val.is_null() && !input_val.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                        let raw_name = v.pointer("/params/update/name")
+                            .or_else(|| v.pointer("/params/update/title"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("");
+                        let kind = v.pointer("/params/update/kind")
+                            .and_then(|k| k.as_str())
+                            .unwrap_or("");
+
+                        let (tool_name, tool_input) = match (raw_name.to_lowercase().as_str(), kind.to_lowercase().as_str()) {
+                            ("bash", _) | ("execute_bash", _) | ("shell", _) | (_, "bash") | (_, "execute") => {
+                                ("Bash".to_string(), input_val.clone())
+                            }
+                            ("read", _) | ("file_read", _) | ("view", _) | (_, "read") => {
+                                let p = input_val.get("file_path").or_else(|| input_val.get("path")).and_then(|p| p.as_str()).unwrap_or("");
+                                if !p.is_empty() && std::path::Path::new(p).is_dir() {
+                                    ("Bash".to_string(), serde_json::json!({"command": format!("ls -la -- {}", crate::engine::session::acp::shell_escape(p))}))
+                                } else {
+                                    ("Read".to_string(), input_val.clone())
+                                }
+                            }
+                            ("edit", _) | ("file_edit", _) | (_, "edit") => {
+                                ("Edit".to_string(), input_val.clone())
+                            }
+                            ("write", _) | ("file_write", _) | (_, "write") => {
+                                ("Write".to_string(), input_val.clone())
+                            }
+                            ("glob", _) | ("find_files", _) => {
+                                ("Glob".to_string(), input_val.clone())
+                            }
+                            ("grep", _) | ("search_files", _) => {
+                                ("Grep".to_string(), input_val.clone())
+                            }
+                            _ => {
+                                let t_name = if !raw_name.is_empty() {
+                                    raw_name.to_string()
+                                } else if !kind.is_empty() {
+                                    kind.to_string()
+                                } else {
+                                    "Bash".to_string()
+                                };
+                                (t_name, input_val.clone())
+                            }
+                        };
+
+                        let is_ready = match tool_name.to_lowercase().as_str() {
+                            "bash" => tool_input.get("command").and_then(|c| c.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false),
+                            "read" => tool_input.get("file_path").or_else(|| tool_input.get("path")).and_then(|p| p.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false),
+                            "edit" => tool_input.get("file_path").or_else(|| tool_input.get("path")).is_some(),
+                            "write" => tool_input.get("file_path").or_else(|| tool_input.get("path")).is_some(),
+                            _ => true,
+                        };
+
+                        if is_ready {
+                            let tool_str = format!("\n<tool_call>\n{{\"name\": \"{}\", \"arguments\": {}}}\n</tool_call>\n", tool_name, tool_input);
+                            let _ = tx.send(AcpOutputChunk::Text(tool_str)).await;
+
+                            if is_debug {
+                                eprintln!("[AcpClient tool_call guard] Intercepted tool call '{}' - delegating to Claude Code", tool_name);
+                            }
+                            let cancel_req = json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/cancel",
+                                "params": { "sessionId": session_id }
+                            });
+                            let _ = stdin.write_all(format!("{}\n", cancel_req).as_bytes()).await;
+                            let _ = stdin.flush().await;
+                            break;
+                        }
+                    }
+                }
+
                 if let Some(err) = v.get("error") {
                     if v.get("id").and_then(|id| id.as_u64()) == Some(3) {
                         if is_debug {

@@ -350,57 +350,66 @@ impl AcpSession {
                         continue;
                     }
 
-                    let (tool_name, tool_input) = if let Some(kind) = v.pointer("/params/update/kind").and_then(|k| k.as_str()) {
-                        match kind.to_lowercase().as_str() {
-                            "bash" | "execute_bash" | "execute" => ("Bash".to_string(), input_val.clone()),
-                            "read" | "file_read" | "view" => ("Read".to_string(), input_val.clone()),
-                            "edit" | "file_edit" => ("Edit".to_string(), input_val.clone()),
-                            "write" | "file_write" => ("Write".to_string(), input_val.clone()),
-                            "skill" | "call_skill" => {
-                                let s_name = input_val.get("skill").or_else(|| input_val.get("name")).and_then(|s| s.as_str()).unwrap_or("");
-                                ("Skill".to_string(), serde_json::json!({"skill": s_name}))
-                            }
-                            "other" => {
-                                if let Some(skill_name) = input_val.get("skill").or_else(|| input_val.get("name")).and_then(|s| s.as_str()) {
-                                    ("Skill".to_string(), serde_json::json!({"skill": skill_name}))
-                                } else if let Some(title) = v.pointer("/params/update/title").and_then(|t| t.as_str()) {
-                                    (title.to_string(), input_val.clone())
-                                } else {
-                                    ("Bash".to_string(), input_val.clone())
-                                }
-                            }
-                            "ls" | "dir" | "list_directory" => {
-                                let path = input_val.get("path").or_else(|| input_val.get("directory")).and_then(|p| p.as_str()).unwrap_or(".");
-                                ("Bash".to_string(), serde_json::json!({"command": format!("ls -la -- {}", shell_escape(path))}))
-                            }
-                            "grep" | "search_files" => {
-                                let pat = input_val.get("pattern").or_else(|| input_val.get("query")).and_then(|p| p.as_str()).unwrap_or("");
-                                let path = input_val.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-                                ("Bash".to_string(), serde_json::json!({"command": format!("grep -rn -- {} {}", shell_escape(pat), shell_escape(path))}))
-                            }
-                            "glob" | "find_files" => {
-                                let pat = input_val.get("pattern").and_then(|p| p.as_str()).unwrap_or("*");
-                                let path = input_val.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-                                ("Bash".to_string(), serde_json::json!({"command": format!("find {} -name {}", shell_escape(path), shell_escape(pat))}))
-                            }
-                            _ => (kind.to_string(), input_val.clone()),
-                        }
-                    } else if let Some(title) = v.pointer("/params/update/title").and_then(|t| t.as_str()) {
-                        if title.to_lowercase().contains("bash") || title.to_lowercase().contains("shell") {
+                    let raw_name = v.pointer("/params/update/name")
+                        .or_else(|| v.pointer("/params/update/title"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("");
+                    let kind = v.pointer("/params/update/kind")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("");
+
+                    let (tool_name, tool_input) = match (raw_name.to_lowercase().as_str(), kind.to_lowercase().as_str()) {
+                        ("bash", _) | ("execute_bash", _) | ("shell", _) | (_, "bash") | (_, "execute") => {
                             ("Bash".to_string(), input_val.clone())
-                        } else {
-                            (title.to_string(), input_val.clone())
                         }
-                    } else {
-                        ("Bash".to_string(), input_val.clone())
+                        ("read", _) | ("file_read", _) | ("view", _) | (_, "read") => {
+                            let p = input_val.get("file_path").or_else(|| input_val.get("path")).and_then(|p| p.as_str()).unwrap_or("");
+                            if !p.is_empty() && std::path::Path::new(p).is_dir() {
+                                ("Bash".to_string(), serde_json::json!({"command": format!("ls -la -- {}", shell_escape(p))}))
+                            } else {
+                                ("Read".to_string(), input_val.clone())
+                            }
+                        }
+                        ("edit", _) | ("file_edit", _) | (_, "edit") => {
+                            ("Edit".to_string(), input_val.clone())
+                        }
+                        ("write", _) | ("file_write", _) | (_, "write") => {
+                            ("Write".to_string(), input_val.clone())
+                        }
+                        ("glob", _) | ("find_files", _) => {
+                            ("Glob".to_string(), input_val.clone())
+                        }
+                        ("grep", _) | ("search_files", _) => {
+                            ("Grep".to_string(), input_val.clone())
+                        }
+                        ("skill", _) | ("call_skill", _) | (_, "skill") => {
+                            let s_name = input_val.get("skill").or_else(|| input_val.get("name")).and_then(|s| s.as_str()).unwrap_or("");
+                            ("Skill".to_string(), serde_json::json!({"skill": s_name}))
+                        }
+                        ("ls" | "dir" | "list_directory", _) => {
+                            let path = input_val.get("path").or_else(|| input_val.get("directory")).and_then(|p| p.as_str()).unwrap_or(".");
+                            ("Bash".to_string(), serde_json::json!({"command": format!("ls -la -- {}", shell_escape(path))}))
+                        }
+                        _ => {
+                            let t_name = if !raw_name.is_empty() {
+                                raw_name.to_string()
+                            } else if !kind.is_empty() {
+                                kind.to_string()
+                            } else {
+                                "Bash".to_string()
+                            };
+                            (t_name, input_val.clone())
+                        }
                     };
 
                     // Check that tool input is actually complete/usable before emitting to Claude Code
                     let is_ready = match tool_name.to_lowercase().as_str() {
                         "bash" => tool_input.get("command").and_then(|c| c.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false),
                         "read" => tool_input.get("file_path").or_else(|| tool_input.get("path")).and_then(|p| p.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false),
-                        "edit" => tool_input.get("file_path").or_else(|| tool_input.get("path")).is_some() && tool_input.get("old_string").is_some(),
+                        "edit" => tool_input.get("file_path").or_else(|| tool_input.get("path")).is_some() && (tool_input.get("old_string").is_some() || tool_input.get("new_string").is_some()),
                         "write" => tool_input.get("file_path").or_else(|| tool_input.get("path")).is_some(),
+                        "glob" => tool_input.get("pattern").is_some(),
+                        "grep" => tool_input.get("pattern").is_some() || tool_input.get("query").is_some(),
                         "skill" => tool_input.get("skill").or_else(|| tool_input.get("name")).is_some(),
                         _ => true,
                     };
@@ -415,6 +424,22 @@ impl AcpSession {
 
                     let tool_str = format!("\n<tool_call>\n{{\"name\": \"{}\", \"arguments\": {}}}\n</tool_call>\n", tool_name, tool_input);
                     let _ = tx.send(crate::protocol::tokens::AcpOutputChunk::Text(tool_str)).await;
+
+                    // GUARD: Instantly cancel OpenCode's internal tool loop so OpenCode does NOT execute the tool.
+                    // The tool MUST be dispatched strictly to Claude Code's harness to execute.
+                    if is_debug {
+                        eprintln!("[ACP tool_call guard] Intercepted tool call '{}' - delegating to Claude Code and cancelling OpenCode internal execution", tool_name);
+                    }
+                    let cancel_req = json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/cancel",
+                        "params": {
+                            "sessionId": current_session_id
+                        }
+                    });
+                    let _ = self.stdin.write_all(format!("{}\n", cancel_req).as_bytes()).await;
+                    let _ = self.stdin.flush().await;
+                    break;
                 }
 
                 if let Some(err) = v.get("error") {
