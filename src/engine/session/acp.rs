@@ -652,6 +652,9 @@ impl AcpSession {
         if final_usage.total() > 0 {
             let _ = tx.send(crate::protocol::tokens::AcpOutputChunk::Usage(final_usage)).await;
         }
+        if let (Some(ref pool), Some(ref proxy)) = (&self.warp_pool, &self.proxy_used) {
+            pool.report_success(proxy);
+        }
         Ok(final_usage)
     }
 }

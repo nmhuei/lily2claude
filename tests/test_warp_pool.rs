@@ -54,6 +54,19 @@ fn test_report_success_clears_cooldown() {
     assert_eq!(pool.acquire_proxy().as_deref(), Some(proxy));
 }
 
+#[test]
+fn test_preemptive_rotation_counter_on_success() {
+    let pool = WarpPool::for_test(vec!["http://127.0.0.1:40001".to_string()]);
+    let proxy = "http://127.0.0.1:40001";
+
+    for _ in 0..5 {
+        pool.report_success(proxy);
+    }
+    let statuses = pool.node_statuses();
+    assert_eq!(statuses.len(), 1);
+    assert!(statuses[0].healthy);
+}
+
 #[tokio::test]
 async fn test_acquire_wait_returns_healthy_node_immediately() {
     let pool = WarpPool::for_test(vec![

@@ -96,6 +96,10 @@ fn default_acquire_wait_secs() -> u64 {
     8
 }
 
+fn default_max_requests_per_ip() -> u64 {
+    30
+}
+
 fn default_true() -> bool {
     true
 }
@@ -122,6 +126,9 @@ pub struct WarpConfig {
     /// rotation) before falling back to the least-cooling node.
     #[serde(default = "default_acquire_wait_secs")]
     pub acquire_wait_secs: u64,
+    /// Proactively rotate egress IP after this many successful requests to prevent rate-limits.
+    #[serde(default = "default_max_requests_per_ip")]
+    pub max_requests_per_ip: u64,
     #[serde(default = "default_true")]
     pub rotation_enabled: bool,
     #[serde(default = "default_true")]
@@ -143,6 +150,7 @@ impl Default for WarpConfig {
             max_attempts: default_max_attempts(),
             rotation_timeout_secs: default_rotation_timeout_secs(),
             acquire_wait_secs: default_acquire_wait_secs(),
+            max_requests_per_ip: default_max_requests_per_ip(),
             rotation_enabled: true,
             require_warp: true,
             require_distinct_egress: false,
@@ -162,6 +170,7 @@ struct NodeRuntimeState {
     last_error: Option<String>,
     last_failure_kind: Option<FailureKind>,
     rotation_count: u64,
+    request_count: u64,
 }
 
 #[derive(Debug)]
@@ -440,13 +449,29 @@ impl WarpPool {
         let Some(node) = self.find_node(proxy) else {
             return;
         };
-        let mut state = node.state.lock().unwrap();
-        state.failures = 0;
-        state.probe_failures = 0;
-        state.cooldown_until = None;
-        state.last_error = None;
-        state.last_failure_kind = None;
-        state.last_ok = Some(Instant::now());
+        let should_rotate = {
+            let mut state = node.state.lock().unwrap();
+            state.failures = 0;
+            state.probe_failures = 0;
+            state.cooldown_until = None;
+            state.last_error = None;
+            state.last_failure_kind = None;
+            state.last_ok = Some(Instant::now());
+            state.request_count = state.request_count.saturating_add(1);
+
+            self.config.rotation_enabled
+                && self.config.max_requests_per_ip > 0
+                && state.request_count >= self.config.max_requests_per_ip
+        };
+
+        if should_rotate {
+            info!(
+                container = %node.container,
+                proxy = %node.proxy_url,
+                "Pre-emptive WARP rotation triggered after serving request limit"
+            );
+            self.spawn_rotation(node);
+        }
     }
 
     fn report_failure_with(&self, proxy: &str, kind: FailureKind, base_override: Option<u64>) {
@@ -724,6 +749,7 @@ impl WarpPool {
                     state.last_error = None;
                     state.last_failure_kind = None;
                     state.rotation_count = state.rotation_count.saturating_add(1);
+                    state.request_count = 0;
                     info!(
                         container = %node.container,
                         egress_ip,
