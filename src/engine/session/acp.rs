@@ -345,11 +345,6 @@ impl AcpSession {
                         .or_else(|| v.pointer("/params/update/input"))
                         .unwrap_or(&serde_json::Value::Null);
 
-                    if input_val.is_null() || input_val.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-                        // Skip intermediate empty updates
-                        continue;
-                    }
-
                     let raw_name = v.pointer("/params/update/name")
                         .or_else(|| v.pointer("/params/update/title"))
                         .and_then(|n| n.as_str())
@@ -357,6 +352,42 @@ impl AcpSession {
                     let kind = v.pointer("/params/update/kind")
                         .and_then(|k| k.as_str())
                         .unwrap_or("");
+                    let status = v.pointer("/params/update/status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+
+                    let input_is_empty = input_val.is_null()
+                        || input_val.as_object().map(|o| o.is_empty()).unwrap_or(true);
+
+                    if input_is_empty {
+                        let name_l = raw_name.to_lowercase();
+                        let kind_l = kind.to_lowercase();
+                        let expects_input = matches!(
+                            name_l.as_str(),
+                            "bash" | "execute_bash" | "shell" | "read" | "file_read" | "view"
+                                | "edit" | "file_edit" | "write" | "file_write" | "glob"
+                                | "find_files" | "grep" | "search_files" | "skill" | "call_skill"
+                                | "ls" | "dir" | "list_directory"
+                        ) || matches!(
+                            kind_l.as_str(),
+                            "bash" | "execute" | "read" | "edit" | "write" | "skill"
+                        );
+
+                        // Argument-bearing tools send an empty placeholder first; ignore it
+                        // and wait for the populated `tool_call_update`. A genuinely
+                        // parameterless tool (e.g. CronList) stays empty forever, so emit it
+                        // once ACP confirms the call is starting instead of swallowing it.
+                        let started = matches!(status, "in_progress" | "completed" | "failed");
+                        if expects_input || !started {
+                            continue;
+                        }
+                    }
+
+                    let input_val = if input_is_empty {
+                        serde_json::json!({})
+                    } else {
+                        input_val.clone()
+                    };
 
                     let (tool_name, tool_input) = match (raw_name.to_lowercase().as_str(), kind.to_lowercase().as_str()) {
                         ("bash", _) | ("execute_bash", _) | ("shell", _) | (_, "bash") | (_, "execute") => {

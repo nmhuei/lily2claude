@@ -23,6 +23,16 @@ fn should_degrade(status: StatusCode) -> bool {
         || status == StatusCode::REQUEST_TIMEOUT
 }
 
+/// Generates a unique Anthropic message id per streamed turn.
+///
+/// Claude Code indexes its conversation history by assistant `message.id`.
+/// Reusing a constant id (e.g. `msg_live_acp`) makes every later assistant
+/// message collapse into the first one, so tool results never reach the model
+/// and it repeats the same tool call until `--max-turns` aborts the session.
+fn next_message_id(prefix: &str) -> String {
+    format!("{}_{}", prefix, uuid::Uuid::new_v4().simple())
+}
+
 pub async fn messages_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -217,6 +227,7 @@ pub async fn messages_handler(
                     }
 
                     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(128);
+                    let message_id = next_message_id("msg_live");
                     let model_clone = req.model.clone();
                     let request_model = req.model.clone();
                     let tools_decl = req.tools.clone().unwrap_or_default();
@@ -225,7 +236,7 @@ pub async fn messages_handler(
 
                     tokio::spawn(async move {
                         let mut adapter = OpenAiStreamAdapter::new(
-                            "msg_live",
+                            &message_id,
                             &model_clone,
                             calculated_input_tokens,
                             is_compact,
@@ -493,6 +504,7 @@ pub async fn messages_handler(
 
             let (sse_tx, sse_rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(1024);
             let tools_decl = req.tools.clone().unwrap_or_default();
+            let message_id = next_message_id("msg_live_acp");
             let s_key_clone = session_key.clone();
             let req_model_clone = req.model.clone();
             let tracker_clone = state.token_tracker.clone();
@@ -507,7 +519,7 @@ pub async fn messages_handler(
 
             tokio::spawn(async move {
                 let engine = AnthropicStreamEngine::new(
-                    "msg_live_acp",
+                    &message_id,
                     &req_model_clone,
                     initial_input_tokens,
                     casing_map,
@@ -727,4 +739,21 @@ pub async fn messages_handler(
     }
 
     (StatusCode::BAD_GATEWAY, "All upstream candidate providers failed").into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_message_id;
+
+    #[test]
+    fn streamed_turn_message_ids_are_unique() {
+        let first = next_message_id("msg_live_acp");
+        let second = next_message_id("msg_live_acp");
+
+        assert!(first.starts_with("msg_live_acp_"));
+        assert_ne!(
+            first, second,
+            "each streamed turn must use a distinct Anthropic message id"
+        );
+    }
 }
