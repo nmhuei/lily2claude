@@ -197,6 +197,10 @@ impl EngineRouter {
                     return res;
                 }
             }
+            return vec![TargetCandidate {
+                provider: "opencode".to_string(),
+                model: "glm-5.3-flash-free".to_string(),
+            }];
         }
         if clean.contains("nemotron") {
             if let Some(targets) = self.config.aliases.get("nemotron") {
@@ -205,6 +209,10 @@ impl EngineRouter {
                     return res;
                 }
             }
+            return vec![TargetCandidate {
+                provider: "opencode".to_string(),
+                model: "nemotron-3.5-lightning-free".to_string(),
+            }];
         }
         if clean.contains("mimo") {
             if let Some(targets) = self.config.aliases.get("mimo") {
@@ -213,9 +221,41 @@ impl EngineRouter {
                     return res;
                 }
             }
+            return vec![TargetCandidate {
+                provider: "opencode".to_string(),
+                model: "mimo-v2.6-flash-free".to_string(),
+            }];
         }
         if clean.contains("kilo") {
             if let Some(targets) = self.config.aliases.get("kilo") {
+                let res = self.resolve_targets(targets, 0);
+                if !res.is_empty() {
+                    return res;
+                }
+            }
+        }
+        if clean.contains("qwen") {
+            if let Some(targets) = self.config.aliases.get("qwen") {
+                let res = self.resolve_targets(targets, 0);
+                if !res.is_empty() {
+                    return res;
+                }
+            }
+        }
+        if clean.contains("minimax") {
+            if let Some(targets) = self.config.aliases.get("minimax") {
+                let res = self.resolve_targets(targets, 0);
+                if !res.is_empty() {
+                    return res;
+                }
+            }
+            return vec![TargetCandidate {
+                provider: "opencode".to_string(),
+                model: "minimax-m3.1-flash-free".to_string(),
+            }];
+        }
+        if clean.contains("kimi") {
+            if let Some(targets) = self.config.aliases.get("kimi") {
                 let res = self.resolve_targets(targets, 0);
                 if !res.is_empty() {
                     return res;

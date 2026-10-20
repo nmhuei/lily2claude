@@ -35,6 +35,13 @@ pub enum Commands {
         #[arg(short = 'H', long, default_value = "127.0.0.1")]
         host: String,
     },
+    /// Manage background daemon (start, stop, restart, status) that persists after terminal exit
+    Server {
+        #[command(subcommand)]
+        action: Option<ServerAction>,
+        #[arg(short, long, default_value = "4001", global = true)]
+        port: u16,
+    },
     /// Launch Claude Code connected to lily2claude with auto-configured context & settings
     Launch {
         #[arg(short, long, default_value = "deepseek")]
@@ -46,13 +53,21 @@ pub enum Commands {
     },
     /// List available models and aliases
     List {
-        #[arg(short, long)]
+        /// Show only free models
+        #[arg(short, long, alias = "free")]
         free_only: bool,
+        /// Show all models including paid ones
+        #[arg(short, long)]
+        all: bool,
     },
     /// List available models and aliases
     Models {
-        #[arg(short, long)]
+        /// Show only free models
+        #[arg(short, long, alias = "free")]
         free_only: bool,
+        /// Show all models including paid ones
+        #[arg(short, long)]
+        all: bool,
     },
     /// Healthcheck Docker WARP nodes and local agents
     #[command(alias = "diagnose", alias = "check")]
@@ -69,6 +84,21 @@ pub enum Commands {
         /// Output raw JSON instead of human-friendly terminal report
         #[arg(long)]
         json: bool,
+        /// Reset token usage statistics and session ledger to 0
+        #[arg(long)]
+        reset: bool,
     },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ServerAction {
+    /// Start the background server daemon
+    Start,
+    /// Stop the background server daemon
+    Stop,
+    /// Restart the background server daemon
+    Restart,
+    /// View background server daemon status
+    Status,
 }
 

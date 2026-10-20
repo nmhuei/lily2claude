@@ -77,7 +77,11 @@ impl Config {
         let path = Self::config_path();
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(cfg) = toml::from_str::<Config>(&content) {
+                if let Ok(mut cfg) = toml::from_str::<Config>(&content) {
+                    let default_cfg = Self::load_default();
+                    for (k, v) in default_cfg.aliases {
+                        cfg.aliases.entry(k).or_insert(v);
+                    }
                     return cfg;
                 }
             }
@@ -133,8 +137,8 @@ impl Config {
         }
 
         aliases.entry("glm".to_string()).or_insert_with(|| vec![
-            "commandcode:z-ai/glm-5.3-flash".to_string(),
             "opencode:glm-5.3-flash-free".to_string(),
+            "commandcode:z-ai/glm-5.3-flash".to_string(),
         ]);
         aliases.entry("kilo".to_string()).or_insert_with(|| vec![
             "kilo:kilo-auto/free".to_string(),
@@ -143,12 +147,23 @@ impl Config {
             "cline:openai-codex:gpt-5.6-luna".to_string(),
         ]);
         aliases.entry("mimo".to_string()).or_insert_with(|| vec![
-            "commandcode:xiaomi/mimo-v2.6-flash".to_string(),
             "opencode:mimo-v2.6-flash-free".to_string(),
+            "commandcode:xiaomi/mimo-v2.6-flash".to_string(),
         ]);
         aliases.entry("nemotron".to_string()).or_insert_with(|| vec![
+            "opencode:nemotron-3.5-lightning-free".to_string(),
+            "opencode:nemotron-3-ultra-free".to_string(),
             "commandcode:nvidia/nemotron-3-ultra-550b-a55b".to_string(),
-            "opencode:nvidia/nemotron-3-nano-free".to_string(),
+        ]);
+        aliases.entry("qwen".to_string()).or_insert_with(|| vec![
+            "opencode:qwen3.6-plus-free".to_string(),
+        ]);
+        aliases.entry("minimax".to_string()).or_insert_with(|| vec![
+            "opencode:minimax-m3.1-flash-free".to_string(),
+            "opencode:minimax-m3-free".to_string(),
+        ]);
+        aliases.entry("kimi".to_string()).or_insert_with(|| vec![
+            "opencode:kimi-k2.5-free".to_string(),
         ]);
 
         let mut providers = HashMap::new();

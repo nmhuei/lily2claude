@@ -132,9 +132,10 @@ pub fn transform_anthropic_to_openai(
                             let raw_content = strip_thinking_text(&raw_content);
 
                             let text_content = if is_compact && raw_content.len() > 300 {
+                                let cut = raw_content.floor_char_boundary(250.min(raw_content.len()));
                                 format!(
                                     "{}...\n[Output truncated: {} chars]",
-                                    &raw_content[..250],
+                                    &raw_content[..cut],
                                     raw_content.len()
                                 )
                             } else {
@@ -150,6 +151,9 @@ pub fn transform_anthropic_to_openai(
                         }
                         ContentBlock::Image { .. } => {
                             text_parts.push("[Image attached]".to_string());
+                        }
+                        ContentBlock::Document { .. } => {
+                            text_parts.push("[Document attached]".to_string());
                         }
                         ContentBlock::Other => {}
                     }

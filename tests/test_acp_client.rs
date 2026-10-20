@@ -7,6 +7,7 @@ async fn test_acp_client_instantiation() {
 }
 
 #[tokio::test]
+#[ignore = "requires live external commandcode CLI"]
 async fn test_acp_session_spawn_and_prompt() {
     use lily2claude::engine::session::AcpSession;
     let mut session = AcpSession::spawn(&["commandcode".to_string(), "acp".to_string()], None).await.expect("spawn session");

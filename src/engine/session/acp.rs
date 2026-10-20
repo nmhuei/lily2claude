@@ -1,64 +1,14 @@
-use crate::protocol::anthropic::{AnthropicContent, ContentBlock, MessagesRequest};
 use serde_json::{json, Value};
-use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
-/// Extracts a deterministic session key from conversation root message
-pub fn extract_session_key(req: &MessagesRequest) -> String {
-    let mut hasher = DefaultHasher::new();
-    if let Some(first_msg) = req.messages.first() {
-        first_msg.role.hash(&mut hasher);
-        match &first_msg.content {
-            AnthropicContent::Text(t) => t.hash(&mut hasher),
-            AnthropicContent::Blocks(blocks) => {
-                for b in blocks {
-                    if let ContentBlock::Text { text } = b {
-                        text.hash(&mut hasher);
-                    }
-                }
-            }
-        }
-    } else {
-        "empty_session".hash(&mut hasher);
-    }
-    format!("{:016x}", hasher.finish())
-}
-
-/// Extracts persistent session key prioritizing Claude Code's native session headers
-pub fn extract_session_key_from_headers_or_req(
-    headers: &axum::http::HeaderMap,
-    req: &MessagesRequest,
-) -> String {
-    // 1. Claude Code native session header
-    if let Some(val) = headers.get("x-claude-code-session-id").and_then(|v| v.to_str().ok()) {
-        let trimmed = val.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    // 2. Custom lily session header
-    if let Some(val) = headers.get("x-lily-session").and_then(|v| v.to_str().ok()) {
-        let trimmed = val.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    // 3. Generic session header
-    if let Some(val) = headers.get("x-session-id").and_then(|v| v.to_str().ok()) {
-        let trimmed = val.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    // 4. Fallback to conversation root message hash
-    extract_session_key(req)
+/// Escapes a shell argument safely using POSIX single-quote escaping
+pub fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 pub struct AcpSession {
@@ -112,7 +62,9 @@ impl AcpSession {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[ACP STDERR] {}", line);
+                if std::env::var_os("L2C_DEBUG_LOG").is_some() {
+                    eprintln!("[ACP STDERR] {}", line);
+                }
             }
         });
 
@@ -205,29 +157,73 @@ impl AcpSession {
         self.stdin.write_all(format!("{}\n", session_req).as_bytes()).await?;
         self.stdin.flush().await?;
 
-        let mut current_session_id = None;
-        while let Some(line) = self.reader.next_line().await? {
-            eprintln!("[ACP session/new raw] {}", &line[..line.len().min(120)]);
-            if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                if v.get("id").and_then(|id| id.as_u64()) == Some(session_call_id) {
-                    if let Some(err) = v.get("error") {
-                        eprintln!("[ACP session/new error] {:?}", err);
-                        anyhow::bail!("ACP session/new failed: {:?}", err);
+        let is_debug = std::env::var_os("L2C_DEBUG_LOG").is_some();
+        let session_new_res = tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(line) = self.reader.next_line().await? {
+                if is_debug {
+                    let cut = line.floor_char_boundary(line.len().min(120));
+                    eprintln!("[ACP session/new raw] {}", &line[..cut]);
+                }
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                    if v.get("id").and_then(|id| id.as_u64()) == Some(session_call_id) {
+                        if let Some(err) = v.get("error") {
+                            if is_debug {
+                                eprintln!("[ACP session/new error] {:?}", err);
+                            }
+                            anyhow::bail!("ACP session/new failed: {:?}", err);
+                        }
+                        if let Some(sid) = v.pointer("/result/sessionId").and_then(|s| s.as_str()) {
+                            return Ok(sid.to_string());
+                        }
+                        anyhow::bail!("ACP session/new result missing sessionId");
                     }
-                    if let Some(sid) = v.pointer("/result/sessionId").and_then(|s| s.as_str()) {
-                        current_session_id = Some(sid.to_string());
-                    }
-                    break;
                 }
             }
+            anyhow::bail!("ACP stdout closed while waiting for session/new response")
+        }).await;
+
+        let current_session_id = match session_new_res {
+            Ok(Ok(sid)) => sid,
+            Ok(Err(e)) => anyhow::bail!("ACP session/new error: {}", e),
+            Err(_) => anyhow::bail!("ACP session/new timed out after 15s"),
+        };
+        if is_debug {
+            eprintln!("[ACP session/new acquired] sid={}", current_session_id);
         }
 
-        let current_session_id = current_session_id.ok_or_else(|| {
-            anyhow::anyhow!("Failed to acquire sessionId from ACP session/new")
-        })?;
-        eprintln!("[ACP session/new acquired] sid={}", current_session_id);
+        // 2. Set model via session/set_config_option
+        if !model.is_empty() {
+            self.rpc_id += 1;
+            let cfg_call_id = self.rpc_id;
+            let cfg_req = json!({
+                "jsonrpc": "2.0",
+                "id": cfg_call_id,
+                "method": "session/set_config_option",
+                "params": {
+                    "sessionId": current_session_id,
+                    "configId": "model",
+                    "value": model
+                }
+            });
+            self.stdin.write_all(format!("{}\n", cfg_req).as_bytes()).await?;
+            self.stdin.flush().await?;
 
-        // 2. session/prompt
+            let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(line) = self.reader.next_line().await? {
+                    if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                        if v.get("id").and_then(|id| id.as_u64()) == Some(cfg_call_id) {
+                            if is_debug {
+                                eprintln!("[ACP session/set_config_option response] {:?}", v);
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+                anyhow::bail!("ACP stdout closed during set_config_option")
+            }).await;
+        }
+
+        // 3. session/prompt
         self.rpc_id += 1;
         let prompt_call_id = self.rpc_id;
         let prompt_req = json!({
@@ -242,9 +238,11 @@ impl AcpSession {
         });
         self.stdin.write_all(format!("{}\n", prompt_req).as_bytes()).await?;
         self.stdin.flush().await?;
-        eprintln!("[ACP session/prompt sent] id={}", prompt_call_id);
+        if is_debug {
+            eprintln!("[ACP session/prompt sent] id={}", prompt_call_id);
+        }
 
-        if std::env::var("L2C_DEBUG_LOG").is_ok() {
+        if is_debug {
             let _ = std::fs::write("/tmp/last_acp_prompt.txt", prompt);
         }
         let mut captured_usage: Option<crate::protocol::tokens::TokenUsage> = None;
@@ -253,55 +251,33 @@ impl AcpSession {
         let mut emitted_tool_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         while let Some(line) = self.reader.next_line().await? {
-            if std::env::var("L2C_DEBUG_LOG").is_ok() {
-                eprintln!("[ACP prompt raw] {}", &line[..line.len().min(120)]);
+            if is_debug {
+                let cut = line.floor_char_boundary(line.len().min(120));
+                eprintln!("[ACP prompt raw] {}", &line[..cut]);
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/acp_raw.log") {
                     use std::io::Write;
                     let _ = writeln!(f, "{}", line);
                 }
             }
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                // Auto-approve session/request_permission to bypass permission prompts automatically
+                // Reject internal ACP tool execution: OpenCode is purely an LLM inference provider,
+                // and all tool execution belongs strictly to the Claude Code harness.
                 if let (Some(method), Some(req_id)) = (v.get("method").and_then(|m| m.as_str()), v.get("id")) {
                     if method == "session/request_permission" {
-                        let option_id = v.pointer("/params/options")
-                            .and_then(|opts| opts.as_array())
-                            .and_then(|arr| {
-                                arr.iter().find_map(|opt| {
-                                    let kind = opt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                                    let opt_id = opt.get("optionId").and_then(|id| id.as_str())?;
-                                    if kind == "allow_always" || opt_id == "always" {
-                                        Some(opt_id.to_string())
-                                    } else {
-                                        None
-                                    }
-                                }).or_else(|| {
-                                    arr.iter().find_map(|opt| {
-                                        let kind = opt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                                        let opt_id = opt.get("optionId").and_then(|id| id.as_str())?;
-                                        if kind == "allow_once" || opt_id == "once" {
-                                            Some(opt_id.to_string())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                })
-                            })
-                            .unwrap_or_else(|| "always".to_string());
-
                         let reply = json!({
                             "jsonrpc": "2.0",
                             "id": req_id,
                             "result": {
                                 "outcome": {
-                                    "outcome": "selected",
-                                    "optionId": option_id
+                                    "outcome": "rejected"
                                 }
                             }
                         });
                         self.stdin.write_all(format!("{}\n", reply).as_bytes()).await?;
                         self.stdin.flush().await?;
-                        eprintln!("[ACP request_permission auto-approved] id={:?} optionId={}", req_id, option_id);
+                        if is_debug {
+                            eprintln!("[ACP request_permission rejected for internal tool execution] id={:?}", req_id);
+                        }
                         continue;
                     }
                 }
@@ -395,17 +371,17 @@ impl AcpSession {
                             }
                             "ls" | "dir" | "list_directory" => {
                                 let path = input_val.get("path").or_else(|| input_val.get("directory")).and_then(|p| p.as_str()).unwrap_or(".");
-                                ("Bash".to_string(), serde_json::json!({"command": format!("ls -la {}", path)}))
+                                ("Bash".to_string(), serde_json::json!({"command": format!("ls -la -- {}", shell_escape(path))}))
                             }
                             "grep" | "search_files" => {
                                 let pat = input_val.get("pattern").or_else(|| input_val.get("query")).and_then(|p| p.as_str()).unwrap_or("");
                                 let path = input_val.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-                                ("Bash".to_string(), serde_json::json!({"command": format!("grep -rn '{}' {}", pat, path)}))
+                                ("Bash".to_string(), serde_json::json!({"command": format!("grep -rn -- {} {}", shell_escape(pat), shell_escape(path))}))
                             }
                             "glob" | "find_files" => {
                                 let pat = input_val.get("pattern").and_then(|p| p.as_str()).unwrap_or("*");
                                 let path = input_val.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-                                ("Bash".to_string(), serde_json::json!({"command": format!("find {} -name '{}'", path, pat)}))
+                                ("Bash".to_string(), serde_json::json!({"command": format!("find {} -name {}", shell_escape(path), shell_escape(pat))}))
                             }
                             _ => (kind.to_string(), input_val.clone()),
                         }
@@ -443,10 +419,14 @@ impl AcpSession {
 
                 if let Some(err) = v.get("error") {
                     if v.get("id").and_then(|id| id.as_u64()) == Some(prompt_call_id) {
-                        eprintln!(">>> ACP RPC ERROR for prompt id {}: {:?}", prompt_call_id, err);
+                        if is_debug {
+                            eprintln!(">>> ACP RPC ERROR for prompt id {}: {:?}", prompt_call_id, err);
+                        }
                         prompt_err = Some(err.clone());
                     } else {
-                        eprintln!(">>> ACP RPC ERROR ignoring mismatched id {:?} (expected {}): {:?}", v.get("id"), prompt_call_id, err);
+                        if is_debug {
+                            eprintln!(">>> ACP RPC ERROR ignoring mismatched id {:?} (expected {}): {:?}", v.get("id"), prompt_call_id, err);
+                        }
                     }
                 }
 
@@ -454,23 +434,32 @@ impl AcpSession {
                 let is_matching_result = v.get("id").and_then(|id| id.as_u64()) == Some(prompt_call_id);
                 let is_stop_notification = v.pointer("/params/update/stopReason").is_some()
                     || v.pointer("/params/stopReason").is_some()
-                    || update_type == Some("turn_end");
+                    || v.pointer("/params/update/finish").is_some()
+                    || v.pointer("/params/finish").is_some()
+                    || v.pointer("/params/update/error").is_some()
+                    || update_type == Some("turn_end")
+                    || update_type == Some("completed")
+                    || update_type == Some("error");
                 let is_stop_result = is_matching_result
                     && (v.pointer("/result/stopReason").is_some()
                         || v.get("result").is_some()
                         || v.get("error").is_some());
 
                 if is_stop_notification || is_stop_result {
-                    eprintln!(
-                        "[ACP prompt broke] is_stop_notification={} is_stop_result={}",
-                        is_stop_notification, is_stop_result
-                    );
+                    if is_debug {
+                        eprintln!(
+                            "[ACP prompt broke] is_stop_notification={} is_stop_result={}",
+                            is_stop_notification, is_stop_result
+                        );
+                    }
                     break;
                 }
             }
         }
-        eprintln!("[ACP prompt reader ended] final_usage={:?} prompt_err={:?}", captured_usage, prompt_err);
-        eprintln!("[ACP child exit status] {:?}", self.child.try_wait());
+        if is_debug {
+            eprintln!("[ACP prompt reader ended] final_usage={:?} prompt_err={:?}", captured_usage, prompt_err);
+            eprintln!("[ACP child exit status] {:?}", self.child.try_wait());
+        }
 
         if let Some(err) = prompt_err {
             let err_str = err.to_string();
@@ -491,155 +480,5 @@ impl AcpSession {
             let _ = tx.send(crate::protocol::tokens::AcpOutputChunk::Usage(final_usage)).await;
         }
         Ok(final_usage)
-    }
-}
-
-
-#[derive(Clone)]
-pub struct SessionManager {
-    sessions: Arc<Mutex<HashMap<String, (Option<u32>, Arc<Mutex<AcpSession>>)>>>,
-    warp_pool: Option<Arc<crate::config::warp_pool::WarpPool>>,
-}
-
-impl Default for SessionManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SessionManager {
-    pub fn new() -> Self {
-        Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            warp_pool: Some(Arc::new(crate::config::warp_pool::WarpPool::default_pool())),
-        }
-    }
-
-    pub fn with_pool(warp_pool: Option<Arc<crate::config::warp_pool::WarpPool>>) -> Self {
-        Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            warp_pool,
-        }
-    }
-
-    pub fn warp_pool(&self) -> Option<Arc<crate::config::warp_pool::WarpPool>> {
-        self.warp_pool.clone()
-    }
-
-    pub async fn active_count(&self) -> usize {
-        let lock = self.sessions.lock().await;
-        lock.len()
-    }
-
-    pub async fn get_or_create(
-        &self,
-        session_key: &str,
-        provider: &str,
-        command: &[String],
-    ) -> anyhow::Result<Arc<Mutex<AcpSession>>> {
-        let base_key = format!("{}:{}", provider, session_key);
-
-        // 1. Try to find an existing idle worker without spawning
-        {
-            let mut lock = self.sessions.lock().await;
-            let mut dead_keys = Vec::new();
-            for worker_idx in 0..4 {
-                let full_key = if worker_idx == 0 {
-                    base_key.clone()
-                } else {
-                    format!("{}:worker_{}", base_key, worker_idx)
-                };
-
-                if let Some((_, existing)) = lock.get(&full_key) {
-                    let (is_alive, is_dead) = match existing.try_lock() {
-                        Ok(mut session_lock) => match session_lock.child.try_wait() {
-                            Ok(None) => (Some(existing.clone()), false),
-                            _ => (None, true),
-                        },
-                        Err(_) => (None, false),
-                    };
-
-                    if let Some(found) = is_alive {
-                        for dk in dead_keys {
-                            lock.remove(&dk);
-                        }
-                        return Ok(found);
-                    }
-                    if is_dead {
-                        dead_keys.push(full_key);
-                    }
-                }
-            }
-            for dk in dead_keys {
-                lock.remove(&dk);
-            }
-        }
-
-        // 2. Spawn new session OUTSIDE the lock to eliminate any possibility of deadlock
-        let new_session = AcpSession::spawn(command, self.warp_pool.clone()).await?;
-        let child_pid = new_session.child_pid;
-        let handle = Arc::new(Mutex::new(new_session));
-
-        // 3. Insert into sessions map with lock
-        let mut lock = self.sessions.lock().await;
-        for worker_idx in 0..4 {
-            let full_key = if worker_idx == 0 {
-                base_key.clone()
-            } else {
-                format!("{}:worker_{}", base_key, worker_idx)
-            };
-            if !lock.contains_key(&full_key) {
-                lock.insert(full_key, (child_pid, handle.clone()));
-                return Ok(handle);
-            }
-        }
-        lock.insert(base_key, (child_pid, handle.clone()));
-        Ok(handle)
-    }
-
-    pub async fn sweep_idle(&self, max_idle: Duration) {
-        let mut lock = self.sessions.lock().await;
-        let mut to_remove = Vec::new();
-
-        for (k, (pid, sess)) in lock.iter() {
-            if let Ok(mut s) = sess.try_lock() {
-                if s.last_used.elapsed() > max_idle {
-                    let _ = s.child.kill().await;
-                    let _ = s.child.wait().await;
-                    if let Some(p) = pid {
-                        let _ = tokio::process::Command::new("kill").args(["-9", &p.to_string()]).output().await;
-                    }
-                    to_remove.push(k.clone());
-                }
-            }
-            // If try_lock() fails, session is currently processing a request - NOT idle, do not kill!
-        }
-
-        for k in to_remove {
-            lock.remove(&k);
-        }
-    }
-
-    pub async fn evict_session(&self, session_key: &str, provider: &str) {
-        let base_prefix = format!("{}:{}", provider, session_key);
-        let mut lock = self.sessions.lock().await;
-        let mut to_remove = Vec::new();
-
-        for (k, (pid, sess)) in lock.iter() {
-            if k == &base_prefix || k.starts_with(&format!("{}:", base_prefix)) {
-                if let Ok(mut s) = sess.try_lock() {
-                    let _ = s.child.kill().await;
-                    let _ = s.child.wait().await;
-                }
-                if let Some(p) = pid {
-                    let _ = tokio::process::Command::new("kill").args(["-9", &p.to_string()]).output().await;
-                }
-                to_remove.push(k.clone());
-            }
-        }
-
-        for k in to_remove {
-            lock.remove(&k);
-        }
     }
 }

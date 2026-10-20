@@ -19,37 +19,23 @@ pub struct MessagesRequest {
 
 impl MessagesRequest {
     pub fn is_compaction_request(&self) -> bool {
-        // 1. Check system instructions
-        if let Some(sys) = &self.system {
-            match sys {
-                SystemPrompt::Single(s) => {
-                    if is_compaction_text(s) {
-                        return true;
-                    }
-                }
-                SystemPrompt::Blocks(blocks) => {
-                    for b in blocks {
-                        if is_compaction_text(&b.text) {
+        // A compaction request MUST ONLY be detected on the CURRENT turn (the last user message).
+        // NEVER check system instructions, historical messages, or assistant responses,
+        // otherwise subsequent normal turns will get stuck in an infinite compaction/summary loop!
+        if let Some(last_msg) = self.messages.last() {
+            if last_msg.role == "user" {
+                match &last_msg.content {
+                    AnthropicContent::Text(t) => {
+                        if is_compaction_text(t) {
                             return true;
                         }
                     }
-                }
-            }
-        }
-
-        // 2. Check messages in reverse (last user message contains Claude Code compaction prompt)
-        for msg in self.messages.iter().rev() {
-            match &msg.content {
-                AnthropicContent::Text(t) => {
-                    if is_compaction_text(t) {
-                        return true;
-                    }
-                }
-                AnthropicContent::Blocks(blocks) => {
-                    for b in blocks {
-                        if let ContentBlock::Text { text } = b {
-                            if is_compaction_text(text) {
-                                return true;
+                    AnthropicContent::Blocks(blocks) => {
+                        for b in blocks {
+                            if let ContentBlock::Text { text } = b {
+                                if is_compaction_text(text) {
+                                    return true;
+                                }
                             }
                         }
                     }
@@ -62,11 +48,11 @@ impl MessagesRequest {
 }
 
 pub fn is_compaction_text(text: &str) -> bool {
-    (text.contains("<summary>") && text.contains("Primary Request and Intent"))
-        || text.contains("REMINDER: Do NOT call any tools. Respond with plain text only")
+    text.contains("Your summary should include the following sections:")
+        || (text.contains("Primary Request and Intent:") && text.contains("Key Technical Concepts:"))
+        || (text.contains("REMINDER: Do NOT call any tools") && text.contains("summary"))
         || text.contains("Free up context by summarizing the conversation")
         || text.contains("You are compacting the conversation")
-        || (text.contains("<summary>") && text.contains("</summary>") && text.contains("summariz"))
 }
 
 fn default_max_tokens() -> u32 {
@@ -143,6 +129,11 @@ pub enum ContentBlock {
         #[serde(default)]
         source: Value,
     },
+    #[serde(rename = "document")]
+    Document {
+        #[serde(default)]
+        source: Value,
+    },
     #[serde(other)]
     Other,
 }
@@ -182,9 +173,6 @@ impl AnthropicTool {
     }
 
     pub fn schema(&self) -> &Value {
-        if self.input_schema.get("properties").is_some() || self.input_schema.get("type").is_some() {
-            return &self.input_schema;
-        }
         &self.input_schema
     }
 }

@@ -11,10 +11,10 @@ use std::sync::Arc;
 #[test]
 fn test_agent_registry_registration_and_diagnose() {
     let mut registry = AgentRegistry::new();
-    let cc = Arc::new(CommandCodeAgent::default());
+    let cc = Arc::new(CommandCodeAgent);
     let kilo = Arc::new(KiloAgent::default());
-    let cline = Arc::new(ClineAgent::default());
-    let opencode = Arc::new(OpenCodeAgent::default());
+    let cline = Arc::new(ClineAgent);
+    let opencode = Arc::new(OpenCodeAgent);
 
     registry.register(cc);
     registry.register(kilo);

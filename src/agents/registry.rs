@@ -22,7 +22,7 @@ impl Default for AgentRegistry {
             order: Vec::new(),
         };
         reg.register(Arc::new(CommandCodeAgent));
-        reg.register(Arc::new(OpenCodeAgent::default()));
+        reg.register(Arc::new(OpenCodeAgent));
         reg.register(Arc::new(KiloAgent::default()));
         reg.register(Arc::new(ClineAgent));
         reg

@@ -141,3 +141,38 @@ fn test_strip_thinking_text_markers_from_history() {
     assert_eq!(openai_req.messages[2].content.as_deref(), Some("Finished subtask successfully."));
 }
 
+#[test]
+fn test_tool_result_multibyte_utf8_truncation_no_panic() {
+    // 249 ASCII chars followed by 3-byte unicode '═' (byte 249..252) followed by more chars
+    let mut unicode_payload = "a".repeat(249);
+    unicode_payload.push('═'); // 3 bytes in UTF-8
+    unicode_payload.push_str(&"b".repeat(100)); // total > 300 bytes
+
+    let req = MessagesRequest {
+        model: "deepseek-v4.1-flash".to_string(),
+        messages: vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_unicode".to_string(),
+                    content: json!(unicode_payload),
+                    is_error: None,
+                }]),
+            },
+        ],
+        system: Some(SystemPrompt::Single("Your task is to create a detailed summary of the conversation so far.".to_string())),
+        tools: None,
+        stream: true,
+        max_tokens: 1024,
+        temperature: None,
+    };
+
+    // Must NOT panic in transform_anthropic_to_openai
+    let res = transform_anthropic_to_openai(&req, true);
+    assert!(res.is_ok());
+
+    // Must NOT panic in build_acp_prompt
+    let acp_res = lily2claude::protocol::prompt::build_acp_prompt(&req);
+    assert!(!acp_res.is_empty());
+}
+

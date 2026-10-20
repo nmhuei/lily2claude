@@ -33,7 +33,7 @@
 - Consumes: `crate::protocol::anthropic::MessagesRequest`
 - Produces: `pub fn build_acp_prompt(req: &MessagesRequest) -> String`
 
-- [ ] **Step 1: Write unit tests for prompt compiler data preservation and compaction**
+- [x] **Step 1: Write unit tests for prompt compiler data preservation and compaction**
 Add tests in `src/protocol/prompt.rs`:
 ```rust
 #[cfg(test)]
@@ -97,10 +97,10 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it compiles and checks current behavior**
+- [x] **Step 2: Run test to verify it compiles and checks current behavior**
 Run: `CARGO_TARGET_DIR=/home/light/Downloads cargo test --lib protocol::prompt`
 
-- [ ] **Step 3: Refactor `build_acp_prompt` in `src/protocol/prompt.rs`**
+- [x] **Step 3: Refactor `build_acp_prompt` in `src/protocol/prompt.rs`**
 Ensure:
 - System context preserves Claude Code instructions without injecting raw JSON schemas.
 - Clean compact tool signatures: `ToolName(req_args, opt_args?)`.
@@ -108,10 +108,10 @@ Ensure:
 - Pre-turn reminders `<system-reminder>` preserved verbatim inside User turns.
 - Proper escaping and serialization of multi-turn tool calls and tool results.
 
-- [ ] **Step 4: Verify prompt compiler tests and existing server tests pass**
+- [x] **Step 4: Verify prompt compiler tests and existing server tests pass**
 Run: `CARGO_TARGET_DIR=/home/light/Downloads cargo test --test test_server`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add src/protocol/prompt.rs
 git commit -m "refactor(prompt): standardize prompt compiler with role preservation and clean tool signatures"
@@ -134,7 +134,7 @@ git commit -m "refactor(prompt): standardize prompt compiler with role preservat
   - `tag_lexer::scan_tool_tag_end(text: &str, open_tag: &str) -> Option<usize>`
   - `json_parser::parse_resilient_json(input: &str) -> ParseResult`
 
-- [ ] **Step 1: Write tests for Tag Lexer & Resilient JSON Parser**
+- [x] **Step 1: Write tests for Tag Lexer & Resilient JSON Parser**
 Create `tests/test_tool_engine.rs`:
 ```rust
 use lily2claude::protocol::tool_engine::tag_lexer::*;
@@ -175,19 +175,19 @@ fn test_resilient_json_parser_single_quotes_in_shell_preserved() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 Run: `CARGO_TARGET_DIR=/home/light/Downloads cargo test --test test_tool_engine`
 Expected: Compilation failure (module does not exist yet).
 
-- [ ] **Step 3: Implement `tag_lexer.rs` and `json_parser.rs`**
+- [x] **Step 3: Implement `tag_lexer.rs` and `json_parser.rs`**
 Implement stateful scanner without regex soup:
 - `tag_lexer.rs`: Exact byte scanning for `<tool_call>`, `</tool_call>`, `<invoke name="...">`, `</invoke>`.
 - `json_parser.rs`: Strict `serde_json::from_str` first. On failure, run stateful tokenizer handling missing closing quotes, braces, trailing commas, unescaped control chars, with recursion depth cap of 16.
 
-- [ ] **Step 4: Run tests to verify pass**
+- [x] **Step 4: Run tests to verify pass**
 Run: `CARGO_TARGET_DIR=/home/light/Downloads cargo test --test test_tool_engine`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add src/protocol/tool_engine/tag_lexer.rs src/protocol/tool_engine/json_parser.rs src/protocol/mod.rs tests/test_tool_engine.rs
 git commit -m "feat(tool_engine): add deterministic tag lexer and resilient JSON parser"
@@ -208,7 +208,7 @@ git commit -m "feat(tool_engine): add deterministic tag lexer and resilient JSON
 - Consumes: `ToolCallCandidate`, declared `tools: &[ToolDefinition]`, `casing_map: &HashMap<String, String>`
 - Produces: `ToolCallEngine::validate_and_normalize(candidate, tools) -> Result<ValidatedToolCall, ValidationError>`
 
-- [ ] **Step 1: Write tests for 3-Tier Schema Normalization and Validation**
+- [x] **Step 1: Write tests for 3-Tier Schema Normalization and Validation**
 Add to `tests/test_tool_engine.rs`:
 ```rust
 #[test]
@@ -237,20 +237,20 @@ fn test_schema_normalizer_conflict_fails() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 Run: `CARGO_TARGET_DIR=/home/light/Downloads cargo test --test test_tool_engine`
 
-- [ ] **Step 3: Implement `schema_normalizer.rs` and `validation.rs`**
+- [x] **Step 3: Implement `schema_normalizer.rs` and `validation.rs`**
 Implement:
 - Tier 2: Non-destructive alias mapping against declared schema (`cmd` -> `command`, `file` -> `file_path`, `dir` -> `path`). Reject with `AmbiguityConflict` if both target and alias are provided.
 - Tier 3: Validation checking `required` properties, non-empty values, primitive types.
 - Facade `ToolCallEngine` in `src/protocol/tool_engine/mod.rs`.
 - Wire `src/protocol/repair/mod.rs` to delegate to `tool_engine` to maintain 100% compatibility with all existing unit tests.
 
-- [ ] **Step 4: Run tests to verify pass**
+- [x] **Step 4: Run tests to verify pass**
 Run: `CARGO_TARGET_DIR=/home/light/Downloads cargo test --lib protocol::repair && CARGO_TARGET_DIR=/home/light/Downloads cargo test --test test_tool_engine`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add src/protocol/tool_engine/ src/protocol/repair/ tests/test_tool_engine.rs
 git commit -m "feat(tool_engine): implement 3-tier schema normalizer and validation engine"
@@ -269,7 +269,7 @@ git commit -m "feat(tool_engine): implement 3-tier schema normalizer and validat
 - Consumes: `StreamInput` (`ThinkingDelta`, `TextDelta`, `UsageUpdate`, `Finish`, `Cancel`, `UpstreamError`)
 - Produces: `Vec<SseEvent>`
 
-- [ ] **Step 1: Write property-based chunk invariance test and FSM transition tests**
+- [x] **Step 1: Write property-based chunk invariance test and FSM transition tests**
 Create `tests/test_stream_engine.rs`:
 ```rust
 use lily2claude::protocol::stream::engine::*;
@@ -313,10 +313,10 @@ fn test_interleaved_thinking_text_tool_text() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 Run: `CARGO_TARGET_DIR=/home/light/Downloads cargo test --test test_stream_engine`
 
-- [ ] **Step 3: Implement `AnthropicStreamEngine` in `src/protocol/stream/engine.rs`**
+- [x] **Step 3: Implement `AnthropicStreamEngine` in `src/protocol/stream/engine.rs`**
 Implement the FSM following Section 3.3 of the spec:
 - States: `Idle`, `Thinking`, `Text`, `ToolTagScan`, `ToolArguments`, `Finished`.
 - Maintain monotonic `block_index`.
@@ -324,10 +324,10 @@ Implement the FSM following Section 3.3 of the spec:
 - Paced 256-byte streaming for `text_delta`.
 - Exact Anthropic SSE block lifecycle.
 
-- [ ] **Step 4: Run tests to verify pass**
+- [x] **Step 4: Run tests to verify pass**
 Run: `CARGO_TARGET_DIR=/home/light/Downloads cargo test --test test_stream_engine`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add src/protocol/stream/engine.rs src/protocol/stream/mod.rs tests/test_stream_engine.rs
 git commit -m "feat(stream): implement AnthropicStreamEngine FSM with chunk invariance"
@@ -347,21 +347,21 @@ git commit -m "feat(stream): implement AnthropicStreamEngine FSM with chunk inva
 - Consumes: `AcpOutputChunk` from ACP child process and SSE `data: {...}` lines from HTTP upstream
 - Produces: Anthropic SSE events sent to `sse_tx` channel
 
-- [ ] **Step 1: Write adapter tests**
+- [x] **Step 1: Write adapter tests**
 Add adapter tests to `tests/test_stream.rs` validating that both ACP input chunks and OpenAI chat completions streaming deltas feed into `AnthropicStreamEngine` identically.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 Run: `CARGO_TARGET_DIR=/home/light/Downloads cargo test --test test_stream`
 
-- [ ] **Step 3: Implement `acp_adapter.rs` and `openai_adapter.rs`**
+- [x] **Step 3: Implement `acp_adapter.rs` and `openai_adapter.rs`**
 - `acp_adapter.rs`: Bridges `AcpOutputChunk` (`Thinking`, `Text`, `Usage`) into `StreamInput` for `AnthropicStreamEngine`.
 - `openai_adapter.rs`: Parses OpenAI SSE json chunks (`choices[0].delta.content`, `choices[0].delta.reasoning_content`) and translates them into `StreamInput`.
 - Wire `src/server/handlers/messages.rs` at line 193 (OpenAI stream) and line 472 (ACP stream) to use the new unified engine.
 
-- [ ] **Step 4: Run full stream test suite**
+- [x] **Step 4: Run full stream test suite**
 Run: `CARGO_TARGET_DIR=/home/light/Downloads cargo test --test test_stream && CARGO_TARGET_DIR=/home/light/Downloads cargo test --lib protocol::stream`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add src/protocol/stream/acp_adapter.rs src/protocol/stream/openai_adapter.rs src/server/handlers/messages.rs tests/test_stream.rs
 git commit -m "refactor(server): integrate unified stream engine for ACP and OpenAI upstreams"
@@ -374,18 +374,18 @@ git commit -m "refactor(server): integrate unified stream engine for ACP and Ope
 **Files:**
 - Test: All 83 existing test suites
 
-- [ ] **Step 1: Run full regression test suite**
+- [x] **Step 1: Run full regression test suite**
 Run: `CARGO_TARGET_DIR=/home/light/Downloads cargo test`
 Expected: 100% pass on all 49 unit tests and all integration tests.
 
-- [ ] **Step 2: Build release candidate binary**
+- [x] **Step 2: Build release candidate binary**
 Run: `CARGO_TARGET_DIR=/home/light/Downloads cargo build --release`
 
-- [ ] **Step 3: Launch staging daemon on port 4002**
+- [x] **Step 3: Launch staging daemon on port 4002**
 Run in background:
 `env L2C_DEBUG_LOG=1 /home/light/Downloads/release/lily2claude serve --port 4002`
 
-- [ ] **Step 4: Execute staging health check and smoke test on port 4002**
+- [x] **Step 4: Execute staging health check and smoke test on port 4002**
 Send test Anthropic Messages request to `http://127.0.0.1:4002/v1/messages` and verify:
 - HTTP 200 OK
 - `event: message_start` with valid usage
@@ -393,10 +393,10 @@ Send test Anthropic Messages request to `http://127.0.0.1:4002/v1/messages` and 
 - `event: content_block_delta`
 - `event: message_stop`
 
-- [ ] **Step 5: Kill staging daemon on port 4002**
+- [x] **Step 5: Kill staging daemon on port 4002**
 Clean up staging process.
 
-- [ ] **Step 6: Commit test results and staging notes**
+- [x] **Step 6: Commit test results and staging notes**
 ```bash
 git commit --allow-empty -m "test(staging): verify staging daemon on port 4002 with 100% test pass"
 ```
@@ -408,22 +408,22 @@ git commit --allow-empty -m "test(staging): verify staging daemon on port 4002 w
 **Files:**
 - Binary: `/home/light/.cargo/bin/lily2claude`
 
-- [ ] **Step 1: Backup current production binary**
+- [x] **Step 1: Backup current production binary**
 ```bash
 cp /home/light/.cargo/bin/lily2claude /home/light/.cargo/bin/lily2claude.bak
 ```
 
-- [ ] **Step 2: Install candidate binary**
+- [x] **Step 2: Install candidate binary**
 ```bash
 cp /home/light/Downloads/release/lily2claude /home/light/.cargo/bin/lily2claude
 ```
 
-- [ ] **Step 3: Controlled restart of port 4001 daemon**
+- [x] **Step 3: Controlled restart of port 4001 daemon**
 - Identify PID from `/tmp/lily2claude_4001.pid` or running background task.
 - Terminate old daemon gracefully.
 - Start new daemon on port 4001.
 
-- [ ] **Step 4: Live Claude Code CLI Verification**
+- [x] **Step 4: Live Claude Code CLI Verification**
 Execute in terminal:
 1. `Bash: pwd` verification:
    `claude --safe-mode --dangerously-skip-permissions --model deepseek -p "Run 'pwd' using Bash and output only the directory."`
@@ -434,5 +434,5 @@ Execute in terminal:
 4. Context ledger verification:
    Verify `/context` output metrics.
 
-- [ ] **Step 5: Deliver comprehensive release verification report**
+- [x] **Step 5: Deliver comprehensive release verification report**
 Update `tasks.md` and report release notes to user.

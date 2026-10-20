@@ -147,3 +147,36 @@ async fn test_token_usage_tracker_record_and_snapshot() {
     assert_eq!(deepseek_model.input_tokens, 3600);
     assert_eq!(deepseek_model.output_tokens, 200);
 }
+
+#[tokio::test]
+async fn test_token_usage_tracker_reset() {
+    let tracker = TokenUsageTracker::new();
+    tracker
+        .record_turn(
+            "session_alpha",
+            "deepseek",
+            TokenUsage {
+                input_tokens: 1200,
+                output_tokens: 80,
+                cache_read_input_tokens: 500,
+                cache_creation_input_tokens: 0,
+            },
+        )
+        .await;
+
+    let snap_before = tracker.snapshot().await;
+    assert_eq!(snap_before.total_requests, 1);
+    assert_eq!(snap_before.cumulative.input_tokens, 1200);
+
+    tracker.reset().await;
+
+    let snap_after = tracker.snapshot().await;
+    assert_eq!(snap_after.total_requests, 0);
+    assert_eq!(snap_after.cumulative.input_tokens, 0);
+    assert_eq!(snap_after.cumulative.output_tokens, 0);
+    assert_eq!(snap_after.cumulative.cached_read_tokens, 0);
+    assert_eq!(snap_after.cumulative.total_tokens, 0);
+    assert_eq!(snap_after.active_sessions_count, 0);
+    assert!(snap_after.models.is_empty());
+}
+

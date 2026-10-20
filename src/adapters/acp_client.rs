@@ -32,27 +32,13 @@ impl AcpClient {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        // Isolate opencode data directory and inject WARP proxy if available
+        // Isolate opencode data directory
         if self.command[0].contains("opencode") {
             cmd.env("XDG_DATA_HOME", "/tmp/lily_opencode_data");
 
-            if std::net::TcpStream::connect_timeout(
-                &std::net::SocketAddr::from(([127, 0, 0, 1], 40001)),
-                std::time::Duration::from_millis(100),
-            )
-            .is_ok()
-            {
-                cmd.env("HTTP_PROXY", "http://127.0.0.1:40001");
-                cmd.env("HTTPS_PROXY", "http://127.0.0.1:40001");
-                cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
-            } else if std::net::TcpStream::connect_timeout(
-                &std::net::SocketAddr::from(([127, 0, 0, 1], 40002)),
-                std::time::Duration::from_millis(100),
-            )
-            .is_ok()
-            {
-                cmd.env("HTTP_PROXY", "http://127.0.0.1:40002");
-                cmd.env("HTTPS_PROXY", "http://127.0.0.1:40002");
+            if let Ok(proxy) = std::env::var("L2C_PROXY") {
+                cmd.env("HTTP_PROXY", &proxy);
+                cmd.env("HTTPS_PROXY", &proxy);
                 cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
             }
         }
@@ -83,12 +69,22 @@ impl AcpClient {
             }
         });
         stdin.write_all(format!("{}\n", init_req).as_bytes()).await?;
-        stdin.flush().await?;
-        while let Some(line) = reader.next_line().await? {
-            if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                if v.get("id").and_then(|id| id.as_u64()) == Some(1) {
-                    break;
+        let init_res = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(line) = reader.next_line().await? {
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                    if v.get("id").and_then(|id| id.as_u64()) == Some(1) {
+                        return Ok(());
+                    }
                 }
+            }
+            anyhow::bail!("ACP initialize stream closed")
+        }).await;
+
+        match init_res {
+            Ok(Ok(())) => {},
+            _ => {
+                let _ = child.kill().await;
+                anyhow::bail!("ACP initialize handshake timed out or failed");
             }
         }
 
@@ -122,27 +118,65 @@ impl AcpClient {
         stdin.write_all(format!("{}\n", session_req).as_bytes()).await?;
         stdin.flush().await?;
 
-        let mut session_id = None;
-        while let Some(line) = reader.next_line().await? {
-            if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                if v.get("id").and_then(|id| id.as_u64()) == Some(2) {
-                    if let Some(err) = v.get("error") {
-                        anyhow::bail!("ACP session/new error: {:?}", err);
+        let session_res = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while let Some(line) = reader.next_line().await? {
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                    if v.get("id").and_then(|id| id.as_u64()) == Some(2) {
+                        if let Some(err) = v.get("error") {
+                            anyhow::bail!("ACP session/new error: {:?}", err);
+                        }
+                        if let Some(sid) = v.pointer("/result/sessionId").and_then(|v| v.as_str()) {
+                            return Ok(sid.to_string());
+                        }
+                        anyhow::bail!("Missing sessionId from ACP session/new");
                     }
-                    if let Some(sid) = v.pointer("/result/sessionId").and_then(|v| v.as_str()) {
-                        session_id = Some(sid.to_string());
-                    }
-                    break;
                 }
             }
+            anyhow::bail!("ACP session/new stream closed")
+        }).await;
+
+        let session_id = match session_res {
+            Ok(Ok(sid)) => sid,
+            _ => {
+                let _ = child.kill().await;
+                anyhow::bail!("ACP session/new timed out or failed");
+            }
+        };
+
+        // 3. session/set_config_option
+        let mut rpc_id = 3;
+        if !model.is_empty() {
+            let cfg_call_id = rpc_id;
+            rpc_id += 1;
+            let cfg_req = json!({
+                "jsonrpc": "2.0",
+                "id": cfg_call_id,
+                "method": "session/set_config_option",
+                "params": {
+                    "sessionId": session_id,
+                    "configId": "model",
+                    "value": model
+                }
+            });
+            stdin.write_all(format!("{}\n", cfg_req).as_bytes()).await?;
+            stdin.flush().await?;
+
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while let Some(line) = reader.next_line().await? {
+                    if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                        if v.get("id").and_then(|id| id.as_u64()) == Some(cfg_call_id) {
+                            return Ok(());
+                        }
+                    }
+                }
+                anyhow::bail!("ACP stream closed during set_config_option")
+            }).await;
         }
 
-        let session_id = session_id.ok_or_else(|| anyhow::anyhow!("Missing sessionId from ACP session/new"))?;
-
-        // 3. session/prompt
+        // 4. session/prompt
         let prompt_req = json!({
             "jsonrpc": "2.0",
-            "id": 3,
+            "id": rpc_id,
             "method": "session/prompt",
             "params": {
                 "sessionId": session_id,
@@ -153,52 +187,30 @@ impl AcpClient {
         stdin.write_all(format!("{}\n", prompt_req).as_bytes()).await?;
         stdin.flush().await?;
 
+        let is_debug = std::env::var_os("L2C_DEBUG_LOG").is_some();
         let mut captured_usage: Option<TokenUsage> = None;
         let mut prompt_err = None;
 
         while let Some(line) = reader.next_line().await? {
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                // Auto-approve session/request_permission to bypass permission prompts automatically
+                // Reject internal ACP tool execution: OpenCode is purely an LLM inference provider,
+                // and all tool execution belongs strictly to the Claude Code harness.
                 if let (Some(method), Some(req_id)) = (v.get("method").and_then(|m| m.as_str()), v.get("id")) {
                     if method == "session/request_permission" {
-                        let option_id = v.pointer("/params/options")
-                            .and_then(|opts| opts.as_array())
-                            .and_then(|arr| {
-                                arr.iter().find_map(|opt| {
-                                    let kind = opt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                                    let opt_id = opt.get("optionId").and_then(|id| id.as_str())?;
-                                    if kind == "allow_always" || opt_id == "always" {
-                                        Some(opt_id.to_string())
-                                    } else {
-                                        None
-                                    }
-                                }).or_else(|| {
-                                    arr.iter().find_map(|opt| {
-                                        let kind = opt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                                        let opt_id = opt.get("optionId").and_then(|id| id.as_str())?;
-                                        if kind == "allow_once" || opt_id == "once" {
-                                            Some(opt_id.to_string())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                })
-                            })
-                            .unwrap_or_else(|| "always".to_string());
-
                         let reply = json!({
                             "jsonrpc": "2.0",
                             "id": req_id,
                             "result": {
                                 "outcome": {
-                                    "outcome": "selected",
-                                    "optionId": option_id
+                                    "outcome": "rejected"
                                 }
                             }
                         });
                         stdin.write_all(format!("{}\n", reply).as_bytes()).await?;
                         stdin.flush().await?;
-                        eprintln!("[ACP request_permission auto-approved] id={:?} optionId={}", req_id, option_id);
+                        if is_debug {
+                            eprintln!("[ACP request_permission rejected for internal tool execution] id={:?}", req_id);
+                        }
                         continue;
                     }
                 }
@@ -245,16 +257,26 @@ impl AcpClient {
 
                 if let Some(err) = v.get("error") {
                     if v.get("id").and_then(|id| id.as_u64()) == Some(3) {
-                        eprintln!(">>> ACP RPC ERROR for prompt id 3: {:?}", err);
+                        if is_debug {
+                            eprintln!(">>> ACP RPC ERROR for prompt id 3: {:?}", err);
+                        }
                         prompt_err = Some(err.clone());
                     } else {
-                        eprintln!(">>> ACP RPC ERROR ignoring mismatched id {:?}: {:?}", v.get("id"), err);
+                        if is_debug {
+                            eprintln!(">>> ACP RPC ERROR ignoring mismatched id {:?}: {:?}", v.get("id"), err);
+                        }
                     }
                 }
 
                 let is_matching_result = v.get("id").and_then(|id| id.as_u64()) == Some(3);
                 let is_stop_notification = v.pointer("/params/update/stopReason").is_some()
-                    || v.pointer("/params/stopReason").is_some();
+                    || v.pointer("/params/stopReason").is_some()
+                    || v.pointer("/params/update/finish").is_some()
+                    || v.pointer("/params/finish").is_some()
+                    || v.pointer("/params/update/error").is_some()
+                    || update_type == Some("turn_end")
+                    || update_type == Some("completed")
+                    || update_type == Some("error");
                 let is_stop_result = is_matching_result
                     && (v.pointer("/result/stopReason").is_some()
                         || v.get("result").is_some()

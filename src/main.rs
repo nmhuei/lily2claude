@@ -1,5 +1,5 @@
 use clap::Parser;
-use lily2claude::cli::{Cli, Commands};
+use lily2claude::cli::{Cli, Commands, ServerAction};
 use lily2claude::config::Config;
 use lily2claude::discovery::catalog::CatalogRegistry;
 use lily2claude::engine::router::EngineRouter;
@@ -15,6 +15,11 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Commands::Serve { port, host }) => {
+            #[cfg(unix)]
+            unsafe {
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            }
+            lily2claude::launcher::daemon::write_pid_file(port, std::process::id());
             let config = Config::load();
             let router = Arc::new(EngineRouter::new(config));
             let app = create_router(router);
@@ -23,6 +28,23 @@ async fn main() -> anyhow::Result<()> {
             println!("⚡ lily2claude server listening on http://{}", addr);
             axum::serve(listener, app).await?;
         }
+        Some(Commands::Server { action, port }) => {
+            match action {
+                Some(ServerAction::Start) | None => {
+                    lily2claude::launcher::daemon::start_daemon(port, true)?;
+                }
+                Some(ServerAction::Stop) => {
+                    lily2claude::launcher::daemon::stop_daemon(port, true)?;
+                }
+                Some(ServerAction::Restart) => {
+                    lily2claude::launcher::daemon::stop_daemon(port, true)?;
+                    lily2claude::launcher::daemon::start_daemon(port, true)?;
+                }
+                Some(ServerAction::Status) => {
+                    lily2claude::launcher::daemon::daemon_status(port);
+                }
+            }
+        }
         Some(Commands::Launch {
             model,
             port,
@@ -30,17 +52,21 @@ async fn main() -> anyhow::Result<()> {
         }) => {
             launch_claude(&model, port, &extra_args)?;
         }
-        Some(Commands::List { free_only } | Commands::Models { free_only }) => {
+        Some(Commands::List { free_only: _, all } | Commands::Models { free_only: _, all }) => {
             let registry =
                 CatalogRegistry::load_from_system().unwrap_or_else(|_| CatalogRegistry::new());
-            let mut list = if free_only {
+            let show_free_only = !all;
+            let mut list = if show_free_only {
                 registry.filter_free_models()
             } else {
                 registry.all_models()
             };
             list.sort_by(|a, b| a.id.cmp(&b.id));
 
-            println!("\n=== Lily2Claude Available Models & Transparent Aliases ===");
+            println!(
+                "\n=== Lily2Claude Available Models {} ===",
+                if show_free_only { "(Free Tier)" } else { "(All Models)" }
+            );
             println!(
                 "{:<35} {:<15} {:<12} {:<10}",
                 "Model / Alias", "Context Window", "Max Output", "Tier"
@@ -56,18 +82,48 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             println!("{:-<75}", "");
+            if show_free_only {
+                println!("💡 Tip: Showing free tier models only. Use 'l2c models --all' to include paid models.");
+            }
             println!("💡 To launch Claude Code with any model: l2c -m <alias>\n");
         }
         Some(Commands::Doctor) => {
             run_doctor().await;
         }
-        Some(Commands::Stats { port, session, json }) => {
-            run_stats(port, session, json).await?;
+        Some(Commands::Stats { port, session, json, reset }) => {
+            if reset {
+                run_reset_usage(port).await?;
+            } else {
+                run_stats(port, session, json).await?;
+            }
         }
         None => {
             // Default when running `l2c`: Launch Claude Code with default or passed model!
             launch_claude(&cli.model, cli.port, &cli.extra_args)?;
         }
+    }
+    Ok(())
+}
+
+async fn run_reset_usage(port: u16) -> anyhow::Result<()> {
+    let url = format!("http://127.0.0.1:{}/v1/usage/reset", port);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()?;
+
+    let resp = match client.post(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("\n❌ Could not connect to lily2claude daemon on port {}.", port);
+            eprintln!("   Make sure the server is running: `l2c serve --port {}`\n", port);
+            return Err(e.into());
+        }
+    };
+
+    if resp.status().is_success() {
+        println!("\n✅ Successfully reset Lily2Claude token usage ledger and session stats to 0.\n");
+    } else {
+        eprintln!("\n❌ Failed to reset usage stats: status {}\n", resp.status());
     }
     Ok(())
 }
@@ -120,7 +176,7 @@ async fn run_stats(port: u16, session_filter: Option<String>, json_output: bool)
     println!("{:<30} {:<10} {:<14} {:<14} {:<14}", "Model Name", "Requests", "Input", "Output", "Total");
     println!("{:-<86}", "");
     let mut model_list: Vec<_> = stats.models.values().collect();
-    model_list.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    model_list.sort_by_key(|b| std::cmp::Reverse(b.total_tokens));
     for m in model_list {
         println!("{:<30} {:<10} {:<14} {:<14} {:<14}",
             m.model_name, m.request_count, m.input_tokens, m.output_tokens, m.total_tokens
@@ -139,7 +195,7 @@ async fn run_stats(port: u16, session_filter: Option<String>, json_output: bool)
             true
         }
     }).collect();
-    session_list.sort_by(|a, b| b.last_activity_epoch_secs.cmp(&a.last_activity_epoch_secs));
+    session_list.sort_by_key(|b| std::cmp::Reverse(b.last_activity_epoch_secs));
 
     for s in session_list {
         println!("{:<38} {:<10} {:<12} {:<12} {:<12}",

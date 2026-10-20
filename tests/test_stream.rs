@@ -1,4 +1,114 @@
-use lily2claude::protocol::stream::SseStreamTranslator;
+use lily2claude::protocol::anthropic::AnthropicTool;
+use lily2claude::protocol::stream::{
+    AcpStreamAdapter, AnthropicStreamEngine, OpenAiStreamAdapter, SseEvent, SseStreamTranslator,
+};
+use lily2claude::protocol::tokens::AcpOutputChunk;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+
+fn bash_tool() -> AnthropicTool {
+    AnthropicTool {
+        name: "Bash".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"]
+        }),
+        ..Default::default()
+    }
+}
+
+fn visible_text(events: &[SseEvent]) -> String {
+    events
+        .iter()
+        .filter(|e| e.event == "content_block_delta")
+        .filter_map(|e| e.data.pointer("/delta/text").and_then(|t| t.as_str()))
+        .collect()
+}
+
+fn tool_calls(events: &[SseEvent]) -> Vec<(String, Value)> {
+    let mut result = Vec::new();
+    let mut active: Option<(u64, String, String)> = None;
+    for event in events {
+        match event.event.as_str() {
+            "content_block_start"
+                if event.data.pointer("/content_block/type").and_then(|t| t.as_str())
+                    == Some("tool_use") =>
+            {
+                active = Some((
+                    event.data["index"].as_u64().unwrap_or(0),
+                    event
+                        .data
+                        .pointer("/content_block/name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    String::new(),
+                ));
+            }
+            "content_block_delta" => {
+                if let Some((index, _, args)) = active.as_mut() {
+                    if event.data["index"].as_u64() == Some(*index)
+                        && event.data.pointer("/delta/type").and_then(|t| t.as_str())
+                            == Some("input_json_delta")
+                    {
+                        args.push_str(
+                            event
+                                .data
+                                .pointer("/delta/partial_json")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(""),
+                        );
+                    }
+                }
+            }
+            "content_block_stop" => {
+                if let Some((index, name, args)) = active.take() {
+                    if event.data["index"].as_u64() == Some(index) {
+                        result.push((
+                            name,
+                            serde_json::from_str(&args).unwrap_or(Value::Null),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
+#[test]
+fn test_acp_and_openai_adapters_share_the_same_engine_semantics() {
+    let text = "Running now.\n<tool_call>{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\"}}</tool_call>\nDone.";
+
+    let acp_engine = AnthropicStreamEngine::new("msg_shared", "deepseek", 10, HashMap::new())
+        .with_tools(&[bash_tool()]);
+    let mut acp = AcpStreamAdapter::new(acp_engine);
+    let mut acp_events = Vec::new();
+    for part in text.split_inclusive(' ') {
+        acp_events.extend(acp.feed(AcpOutputChunk::Text(part.to_string())));
+    }
+    acp_events.extend(acp.finish(5));
+
+    let mut openai = OpenAiStreamAdapter::new("msg_shared", "deepseek", 10, false, &[bash_tool()]);
+    let mut openai_events = Vec::new();
+    // Split the SSE payload at an awkward byte boundary to exercise the line
+    // buffer, and deliberately omit the space after `data:`.
+    let payload = json!({
+        "choices": [{"delta": {"content": text}}]
+    })
+    .to_string();
+    let wire = format!("data:{}\n\ndata: [DONE]\n\n", payload);
+    let split = wire.len() / 2;
+    openai_events.extend(openai.feed_bytes(&wire.as_bytes()[..split]));
+    openai_events.extend(openai.feed_bytes(&wire.as_bytes()[split..]));
+    openai_events.extend(openai.finish());
+
+    assert_eq!(visible_text(&acp_events), visible_text(&openai_events));
+    assert_eq!(tool_calls(&acp_events), tool_calls(&openai_events));
+    assert_eq!(tool_calls(&acp_events)[0].1["command"], "pwd");
+}
 
 #[test]
 fn test_sse_stream_state_machine_and_casing() {

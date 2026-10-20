@@ -1,8 +1,6 @@
 use crate::discovery::catalog::CatalogRegistry;
 use serde_json::json;
 use std::process::Command;
-use std::time::Duration;
-use tracing::info;
 
 pub fn build_settings_json(model: &str, port: u16, context_tokens: u32) -> String {
     let cfg = crate::config::Config::load();
@@ -25,41 +23,103 @@ pub fn build_settings_json(model: &str, port: u16, context_tokens: u32) -> Strin
             "CLAUDE_CODE_SUBAGENT_MODEL": &l.subagent_model,
             "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
             "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": &l.subagent_model,
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+            "CLAUDE_CODE_WORKFLOWS": "1",
+            "CLAUDE_CODE_FORK_SUBAGENT": "0",
+            "CLAUDE_AUTO_BACKGROUND_TASKS": "1",
+            "CLAUDE_CODE_ENABLE_TASKS": "1",
+            "CLAUDE_CODE_AGENT_PROGRESS_SUMMARIES": "1",
             "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1",
             "CLAUDE_CODE_DISABLE_MODEL_ACCESS_FALLBACK": "1",
-            "CLAUDE_CODE_NO_MODEL_FALLBACK": "1",
             "CLAUDE_CODE_MAX_CONTEXT_TOKENS": context_tokens.to_string(),
-            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": if context_tokens >= 1_000_000 { "50" } else { "80" },
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": (context_tokens.saturating_mul(8) / 10).to_string(),
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "80",
             "API_TIMEOUT_MS": "600000",
             "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS": "600000",
             "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "600000",
             "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": "600000",
         },
-        "skipDangerousModePermissionPrompt": true
+        "modelPicker": {
+            "options": [
+                {
+                    "model": "deepseek",
+                    "label": "DeepSeek V4.1 Flash (deepseek)",
+                    "description": "DeepSeek V4.1 Flash Free via OpenCode (200k Context · Default Coding Model)",
+                    "behavesAs": "claude-sonnet-4-5"
+                },
+                {
+                    "model": "glm",
+                    "label": "GLM 5.3 Flash (glm)",
+                    "description": "GLM 5.3 Flash Free via OpenCode (200k Context · High Intelligence & Reasoning)",
+                    "behavesAs": "claude-sonnet-4-5"
+                },
+                {
+                    "model": "claude-haiku-4-5-20251001",
+                    "label": "Haiku 4.5 (haiku)",
+                    "description": "Claude Haiku 4.5 · Fast Subagent Engine (backed by Free DeepSeek/MiMo)",
+                    "behavesAs": "claude-haiku-4-5"
+                },
+                {
+                    "model": "mimo",
+                    "label": "MiMo V2.6 Flash (mimo)",
+                    "description": "Xiaomi MiMo V2.6 Flash Free via OpenCode (64k Context · Ultra Low Latency)",
+                    "behavesAs": "claude-haiku-4-5"
+                },
+                {
+                    "model": "nemotron",
+                    "label": "Nemotron 3 Nano (nemotron)",
+                    "description": "NVIDIA Nemotron 3 Free via OpenCode (1M Context · Large Codebase)",
+                    "behavesAs": "claude-opus-4-6"
+                },
+                {
+                    "model": "qwen",
+                    "label": "Qwen 3.6 Plus (qwen)",
+                    "description": "Alibaba Qwen 3.6 Plus Free via OpenCode (262k Context · Math & Code)",
+                    "behavesAs": "claude-sonnet-4-5"
+                },
+                {
+                    "model": "minimax",
+                    "label": "MiniMax M3 (minimax)",
+                    "description": "MiniMax M3 Free via OpenCode (200k Context · General Assistant)",
+                    "behavesAs": "claude-sonnet-4-5"
+                },
+                {
+                    "model": "kimi",
+                    "label": "Kimi K2.5 (kimi)",
+                    "description": "Moonshot Kimi K2.5 Free via OpenCode (262k Context · Long Context Agent)",
+                    "behavesAs": "claude-sonnet-4-5"
+                },
+                {
+                    "model": "kilo",
+                    "label": "Kilo Auto Free (kilo)",
+                    "description": "Kilo Auto Free Router (262k Context · Dynamic Multi-Provider)",
+                    "behavesAs": "claude-sonnet-4-5"
+                }
+            ],
+            "replaceBuiltInOptions": true
+        },
+        "skipDangerousModePermissionPrompt": true,
+        "enableWorkflows": true,
+        "disableWorkflows": false,
+        "skipWorkflowUsageWarning": true,
+        "autoCompactEnabled": true,
+        "autoCompactWindow": context_tokens.saturating_mul(8) / 10,
+        "modelSettings": {
+            "deepseek": { "autoCompactWindow": 160000, "effortLevel": "high" },
+            "glm": { "autoCompactWindow": 160000, "effortLevel": "high" },
+            "mimo": { "autoCompactWindow": 50000 },
+            "nemotron": { "autoCompactWindow": 800000 },
+            "qwen": { "autoCompactWindow": 200000 },
+            "minimax": { "autoCompactWindow": 160000 },
+            "kimi": { "autoCompactWindow": 200000 },
+            "kilo": { "autoCompactWindow": 200000 }
+        }
     })
     .to_string()
 }
 
 pub fn ensure_server_running(port: u16) {
-    if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-        return; // Server is already listening
-    }
-
-    info!(port, "Server not detected on port, starting background daemon...");
-    let exe = std::env::current_exe().unwrap_or_else(|_| "lily2claude".into());
-    let _ = Command::new(exe)
-        .arg("serve")
-        .arg("--port")
-        .arg(port.to_string())
-        .spawn();
-
-    // Poll up to 2 seconds for server bind
-    for _ in 0..20 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    crate::launcher::daemon::ensure_server_running(port);
 }
 
 pub fn launch_claude(model: &str, port: u16, extra_args: &[String]) -> anyhow::Result<()> {
@@ -93,11 +153,18 @@ pub fn launch_claude(model: &str, port: u16, extra_args: &[String]) -> anyhow::R
     cmd.env("CLAUDE_CODE_SUBAGENT_MODEL", &l.subagent_model);
     cmd.env("CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "1");
     cmd.env("CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL", &l.subagent_model);
+    cmd.env("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
+    cmd.env("CLAUDE_CODE_WORKFLOWS", "1");
+    cmd.env("CLAUDE_CODE_FORK_SUBAGENT", "0");
+    cmd.env("CLAUDE_AUTO_BACKGROUND_TASKS", "1");
+    cmd.env("CLAUDE_CODE_ENABLE_TASKS", "1");
+    cmd.env("CLAUDE_CODE_AGENT_PROGRESS_SUMMARIES", "1");
     cmd.env("CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT", "1");
     cmd.env("CLAUDE_CODE_DISABLE_MODEL_ACCESS_FALLBACK", "1");
     cmd.env("CLAUDE_CODE_NO_MODEL_FALLBACK", "1");
     cmd.env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", ctx.to_string());
-    cmd.env("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", if ctx >= 1_000_000 { "50" } else { "80" });
+    cmd.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", (ctx.saturating_mul(8) / 10).to_string());
+    cmd.env("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "80");
     cmd.env("API_TIMEOUT_MS", "600000");
     cmd.env("CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS", "600000");
     cmd.env("CLAUDE_STREAM_IDLE_TIMEOUT_MS", "600000");

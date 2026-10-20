@@ -152,3 +152,39 @@ fn test_build_acp_prompt_compaction_truncates_and_injects_directive() {
     assert!(prompt.contains("Produce ONLY the concise summary enclosed within <summary>...</summary> tags."));
 }
 
+#[tokio::test]
+async fn test_turn_after_compaction_is_not_compaction() {
+    let req = MessagesRequest {
+        model: "claude-sonnet-5-5".to_string(),
+        system: None,
+        tools: Some(vec![AnthropicTool {
+            name: "Bash".to_string(),
+            description: Some("Run command".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            ..Default::default()
+        }]),
+        messages: vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Text("Free up context by summarizing the conversation".to_string()),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: AnthropicContent::Text("<summary>\n1. Primary Request and Intent: Audit project\n</summary>".to_string()),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Text("tiếp tục triển khai kế hoạch đi".to_string()),
+            },
+        ],
+        stream: true,
+        max_tokens: 4096,
+        temperature: None,
+    };
+
+    assert!(!req.is_compaction_request(), "Turn after compaction must NOT be detected as compaction request");
+    let prompt = build_acp_prompt(&req);
+    assert!(prompt.contains("[Tools Instruction]"), "Tools instruction must be restored on subsequent turn");
+    assert!(!prompt.contains("[COMPACTION DIRECTIVE]"), "Compaction directive must NOT be injected on normal turn");
+}
+
