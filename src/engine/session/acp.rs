@@ -410,14 +410,11 @@ impl AcpSession {
                     .and_then(|t| t.as_str())
                 {
                     if !text.is_empty() {
-                        if text.contains("provider.quota")
-                            || text.contains("Rate limit exceeded")
-                            || text.contains("rate limit exceeded")
-                        {
+                        if crate::config::warp_pool::is_upstream_rate_limited(text) {
                             if let (Some(ref pool), Some(ref proxy)) = (&self.warp_pool, &self.proxy_used) {
                                 warn!(
                                     proxy = %proxy,
-                                    "ACP upstream rate limited; cooling this WARP node and failing over"
+                                    "ACP upstream rate limited; cooling this WARP node and triggering fast rotation"
                                 );
                                 pool.mark_rate_limited(proxy, 300);
                             }
@@ -639,15 +636,11 @@ impl AcpSession {
 
         if let Some(err) = prompt_err {
             let err_str = err.to_string();
-            if err_str.contains("provider.quota")
-                || err_str.contains("Rate limit exceeded")
-                || err_str.contains("rate limit")
-                || err_str.contains("429")
-            {
+            if crate::config::warp_pool::is_upstream_rate_limited(&err_str) {
                 if let (Some(ref pool), Some(ref proxy)) = (&self.warp_pool, &self.proxy_used) {
                     warn!(
                         proxy = %proxy,
-                        "ACP session/prompt rate limited; cooling this WARP node and failing over"
+                        "ACP session/prompt rate limited; cooling this WARP node and triggering fast rotation"
                     );
                     pool.mark_rate_limited(proxy, 300);
                 }

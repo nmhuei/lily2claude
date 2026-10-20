@@ -80,9 +80,47 @@ impl Agent for GenericAcpAgent {
         let mut cmd = vec![self.binary.clone()];
         cmd.extend(self.args.clone());
         if let (Some(mgr), Some(key)) = (session_mgr, session_key) {
-            let session = mgr.get_or_create(key, self.id(), &cmd).await?;
-            let mut lock = session.lock().await;
-            lock.send_prompt(model, prompt, tx).await
+            let mut last_err = None;
+            for attempt in 0..4 {
+                let session = mgr.get_or_create(key, self.id(), &cmd).await?;
+                let mut lock = session.lock().await;
+                match lock.send_prompt(model, prompt, tx.clone()).await {
+                    Ok(usage) => return Ok(usage),
+                    Err(err) => {
+                        let err_str = err.to_string();
+                        mgr.evict_session(key, self.id()).await;
+                        last_err = Some(err);
+
+                        let rate_limited = crate::config::warp_pool::is_upstream_rate_limited(&err_str);
+                        let transient = err_str.contains("provider.invalid-output")
+                            || err_str.contains("-32603")
+                            || err_str.contains("OpenAI Chat tool call delta is missing id or name");
+
+                        if rate_limited {
+                            if std::env::var_os("L2C_DEBUG_LOG").is_some() {
+                                eprintln!(
+                                    "[GenericACP execute_turn] rate limited on attempt {}, retrying with another proxy",
+                                    attempt
+                                );
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            continue;
+                        }
+
+                        if transient {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
+
+                        return Err(last_err.unwrap());
+                    }
+                }
+            }
+
+            if let Some(err) = last_err {
+                return Err(err);
+            }
+            anyhow::bail!("ACP turn failed after retries")
         } else {
             let client = AcpClient::new(cmd);
             client.run_prompt(model, prompt, tx).await

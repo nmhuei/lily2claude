@@ -4,7 +4,7 @@ pub mod models;
 pub mod stats;
 pub mod tokens;
 
-pub use health::health_handler;
+pub use health::{health_handler, warp_health_handler};
 pub use messages::messages_handler;
 pub use models::models_handler;
 pub use stats::{reset_usage_handler, stats_handler};

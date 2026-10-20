@@ -1,5 +1,6 @@
 pub mod warp_pool;
 
+use crate::config::warp_pool::WarpConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -56,6 +57,8 @@ pub struct Config {
     pub default_target: String,
     #[serde(default)]
     pub launcher: LauncherConfig,
+    #[serde(default)]
+    pub warp: WarpConfig,
     pub aliases: HashMap<String, Vec<String>>,
     pub providers: HashMap<String, ProviderConfig>,
 }
@@ -221,6 +224,7 @@ impl Config {
             server_host: "127.0.0.1".to_string(),
             default_target: "deepseek".to_string(),
             launcher: LauncherConfig::default(),
+            warp: WarpConfig::default(),
             aliases,
             providers,
         }

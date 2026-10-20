@@ -1,6 +1,6 @@
 use super::handlers::{
     count_tokens_handler, health_handler, messages_handler, models_handler, reset_usage_handler,
-    stats_handler,
+    stats_handler, warp_health_handler,
 };
 use super::state::AppState;
 use crate::engine::router::EngineRouter;
@@ -21,6 +21,13 @@ pub fn create_router(router: Arc<EngineRouter>) -> Router {
         token_tracker,
     };
 
+    // Start one real-egress prober per configured pool.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        for pool in state.warp_pools() {
+            pool.spawn_prober();
+        }
+    }
+
     // Background idle cleanup: evicts sessions inactive for > 5 minutes
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -32,6 +39,7 @@ pub fn create_router(router: Arc<EngineRouter>) -> Router {
 
     Router::new()
         .route("/health", get(health_handler))
+        .route("/health/warp", get(warp_health_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/stats", get(stats_handler))
         .route("/v1/usage", get(stats_handler))

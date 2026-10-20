@@ -293,6 +293,15 @@ impl EngineRouter {
         self.http_adapters.get(provider).cloned()
     }
 
+    /// Pools created from `warp_proxies` provider configuration. Used by the
+    /// `/health/warp` endpoint and the background prober.
+    pub fn warp_pools(&self) -> Vec<Arc<WarpPool>> {
+        self.http_adapters
+            .values()
+            .filter_map(|adapter| adapter.warp_pool())
+            .collect()
+    }
+
     pub fn get_acp_adapter(&self, provider: &str) -> Option<Arc<AcpClient>> {
         self.acp_adapters.get(provider).cloned()
     }

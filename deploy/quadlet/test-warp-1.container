@@ -1,0 +1,28 @@
+# Rootless Podman Quadlet unit for WARP egress node 1.
+#
+# Install:
+#   cp deploy/quadlet/*.container ~/.config/containers/systemd/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now test-warp-1.service
+#
+# Pin the image by digest for reproducible deployments:
+#   ghcr.io/mon-ius/docker-warp-socks@sha256:<digest>
+
+[Unit]
+Description=Cloudflare WARP SOCKS/HTTP proxy node 1
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/mon-ius/docker-warp-socks:latest
+ContainerName=test-warp-1
+PublishPort=127.0.0.1:40001:9091
+Volume=test-warp-1-config:/etc/sing-box
+
+[Service]
+Restart=always
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

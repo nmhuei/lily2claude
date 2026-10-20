@@ -75,10 +75,28 @@ impl SessionManager {
 
                 if let Some((_, existing)) = lock.get(&full_key) {
                     let (is_alive, is_dead) = match existing.try_lock() {
-                        Ok(mut session_lock) => match session_lock.child.try_wait() {
-                            Ok(None) => (Some(existing.clone()), false),
-                            _ => (None, true),
-                        },
+                        Ok(mut session_lock) => {
+                            let proxy_cooling = if let (Some(ref pool), Some(ref proxy)) = (&self.warp_pool, &session_lock.proxy_used) {
+                                pool.is_proxy_cooling(proxy)
+                            } else {
+                                false
+                            };
+
+                            if proxy_cooling {
+                                tracing::warn!(
+                                    session = %full_key,
+                                    proxy = ?session_lock.proxy_used,
+                                    "Session proxy is cooling down; terminating worker to force failover"
+                                );
+                                let _ = session_lock.child.start_kill();
+                                (None, true)
+                            } else {
+                                match session_lock.child.try_wait() {
+                                    Ok(None) => (Some(existing.clone()), false),
+                                    _ => (None, true),
+                                }
+                            }
+                        }
                         Err(_) => (None, false),
                     };
 

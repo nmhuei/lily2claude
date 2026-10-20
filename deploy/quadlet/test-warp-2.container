@@ -1,0 +1,20 @@
+# Rootless Podman Quadlet unit for WARP egress node 2.
+
+[Unit]
+Description=Cloudflare WARP SOCKS/HTTP proxy node 2
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/mon-ius/docker-warp-socks:latest
+ContainerName=test-warp-2
+PublishPort=127.0.0.1:40002:9091
+Volume=test-warp-2-config:/etc/sing-box
+
+[Service]
+Restart=always
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

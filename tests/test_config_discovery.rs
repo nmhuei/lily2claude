@@ -3,7 +3,7 @@ use lily2claude::discovery::catalog::CatalogRegistry;
 
 #[test]
 fn test_warp_pool_failover_and_cooldown() {
-    let pool = WarpPool::new(vec![
+    let pool = WarpPool::for_test(vec![
         "socks5h://127.0.0.1:40001".to_string(),
         "socks5h://127.0.0.1:40002".to_string(),
     ]);

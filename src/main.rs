@@ -210,11 +210,14 @@ async fn run_stats(port: u16, session_filter: Option<String>, json_output: bool)
 async fn run_doctor() {
     println!("\n🩺 === Lily2Claude Environment & DevOps Doctor ===\n");
 
-    // 1. Check Docker WARP Nodes
+    // 1. Verify the host WARP client is not nesting container WARP traffic.
+    check_host_warp_bypass();
+
+    // 2. Check WARP egress nodes with a real `warp=on` probe.
     check_warp_node("WARP Node 1", 40001).await;
     check_warp_node("WARP Node 2", 40002).await;
 
-    // 2. Dynamic Modular Agent Diagnostics (Zero Hardcoding)
+    // 3. Dynamic Modular Agent Diagnostics (Zero Hardcoding)
     let agent_reg = lily2claude::agents::AgentRegistry::default();
     for diag in agent_reg.diagnose_all() {
         if diag.installed {
@@ -230,31 +233,108 @@ async fn run_doctor() {
         }
     }
 
-    // 3. Check Claude Code CLI
+    // 4. Check Claude Code CLI
     check_agent_binary("Claude Code", "claude").await;
 
     println!("\nDoctor check completed.\n");
+}
+
+/// The host WARP client must let traffic to the WARP edge bypass its own tunnel.
+/// Otherwise container WARP gets nested inside host WARP and dies with
+/// `sendmmsg: message too long` because the outer tunnel MTU is 1280.
+fn check_host_warp_bypass() {
+    const ENDPOINTS: &[(&str, &str)] = &[
+        ("ip", "162.159.192.1"),
+        ("ip", "162.159.195.1"),
+        ("ip", "188.114.96.1"),
+        ("ip", "188.114.99.1"),
+        ("ip -6", "2606:4700:d0::a29f:c001"),
+        ("ip -6", "2606:4700:d1::a29f:c001"),
+    ];
+
+    let mut captured = Vec::new();
+    let mut checked = 0usize;
+
+    for &(family, endpoint) in ENDPOINTS {
+        let args: Vec<&str> = if family == "ip -6" {
+            vec!["-6", "route", "get", endpoint]
+        } else {
+            vec!["route", "get", endpoint]
+        };
+
+        if let Ok(output) = std::process::Command::new("ip").args(&args).output() {
+            if output.status.success() {
+                checked += 1;
+                if String::from_utf8_lossy(&output.stdout).contains("CloudflareWARP") {
+                    captured.push(endpoint);
+                }
+            }
+        }
+    }
+
+    if !captured.is_empty() {
+        println!(
+            "  [✗] Host WARP       : {} endpoint(s) still routed into CloudflareWARP (nested VPN): {}",
+            captured.len(),
+            captured.join(", ")
+        );
+        println!("      Fix: scripts/setup-warp.sh   (or add these exclusions manually)");
+        println!("           warp-cli --accept-tos tunnel ip add-range 162.159.192.0/24");
+        println!("           warp-cli --accept-tos tunnel ip add-range 162.159.193.0/24");
+        println!("           warp-cli --accept-tos tunnel ip add-range 162.159.195.0/24");
+        println!("           warp-cli --accept-tos tunnel ip add-range 188.114.96.0/24 ... 99.0/24");
+        println!("           warp-cli --accept-tos tunnel ip add-range 2606:4700:d0::/48");
+        println!("           warp-cli --accept-tos tunnel ip add-range 2606:4700:d1::/48");
+    } else if checked == 0 {
+        println!("  [✗] Host WARP       : cannot inspect routes (`ip` unavailable or no route)");
+    } else {
+        println!(
+            "  [✓] Host WARP       : {} WARP edge endpoints bypass the host tunnel",
+            checked
+        );
+    }
 }
 
 async fn check_warp_node(name: &str, port: u16) {
     let proxy_url = format!("socks5h://127.0.0.1:{}", port);
     let client = reqwest::Client::builder()
         .proxy(reqwest::Proxy::all(&proxy_url).unwrap())
-        .timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(6))
         .build();
 
     match client {
-        Ok(c) => match c.get("https://ifconfig.me/ip").send().await {
-            Ok(resp) => {
-                let ip = resp.text().await.unwrap_or_default().trim().to_string();
-                println!("  [✓] {:<15} (port {:<5}): ACTIVE -> Egress IP: {}", name, port, ip);
+        Ok(client) => match client
+            .get("https://www.cloudflare.com/cdn-cgi/trace")
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let body = response.text().await.unwrap_or_default();
+                let ip = body
+                    .lines()
+                    .find_map(|line| line.strip_prefix("ip="))
+                    .unwrap_or("unknown");
+
+                match lily2claude::config::warp_pool::parse_warp_trace(&body) {
+                    Some(egress_ip) => println!(
+                        "  [✓] {:<15} (port {:<5}): ACTIVE -> Egress IP: {} (warp=on)",
+                        name, port, egress_ip
+                    ),
+                    None => println!(
+                        "  [✗] {:<15} (port {:<5}): ERROR (egress is not WARP, ip={})",
+                        name, port, ip
+                    ),
+                }
             }
-            Err(e) => {
-                println!("  [✗] {:<15} (port {:<5}): ERROR ({})", name, port, e);
+            Err(err) => {
+                println!("  [✗] {:<15} (port {:<5}): ERROR ({})", name, port, err);
             }
         },
-        Err(e) => {
-            println!("  [✗] {:<15} (port {:<5}): FAILED TO BUILD CLIENT ({})", name, port, e);
+        Err(err) => {
+            println!(
+                "  [✗] {:<15} (port {:<5}): FAILED TO BUILD CLIENT ({})",
+                name, port, err
+            );
         }
     }
 }

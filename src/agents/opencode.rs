@@ -123,11 +123,7 @@ impl Agent for OpenCodeAgent {
                         }
                         mgr.evict_session(key, self.id()).await;
                         last_err = Some(e);
-                        if err_str.contains("provider.quota")
-                            || err_str.contains("Rate limit exceeded")
-                            || err_str.contains("rate limit")
-                            || err_str.contains("429")
-                        {
+                        if crate::config::warp_pool::is_upstream_rate_limited(&err_str) {
                             if std::env::var_os("L2C_DEBUG_LOG").is_some() {
                                 eprintln!("[OpenCode execute_turn] rate limited on attempt {}, failing over to next proxy: {}", attempt, err_str);
                             }
