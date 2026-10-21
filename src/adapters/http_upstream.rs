@@ -198,9 +198,11 @@ impl HttpUpstreamAdapter {
 
 fn uuid_simple() -> String {
     use std::time::SystemTime;
+    // A clock before the epoch only means we cannot derive a timestamp-based
+    // id; fall back to zero rather than panicking inside request construction.
     let t = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     format!("{t:x}")
 }

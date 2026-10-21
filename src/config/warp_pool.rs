@@ -609,13 +609,7 @@ impl WarpPool {
         let now = Instant::now();
         self.nodes
             .iter()
-            .min_by_key(|node| {
-                node.state
-                    .lock()
-                    .unwrap()
-                    .cooldown_until
-                    .unwrap_or(now)
-            })
+            .min_by_key(|node| node.lock_state().cooldown_until.unwrap_or(now))
             .cloned()
     }
 
