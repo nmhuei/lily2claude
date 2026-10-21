@@ -12,6 +12,42 @@ impl OpenCodeAgent {
     pub fn auth_path() -> PathBuf {
         crate::config::home_dir().join(".local/share/opencode/auth.json")
     }
+
+    /// `XDG_DATA_HOME` handed to every opencode child process.
+    ///
+    /// opencode keeps a SQLite database here, so it has to be persistent
+    /// storage. `std::env::temp_dir()` is not good enough: on Linux it resolves
+    /// to `/tmp`, which is RAM-backed on most distros and wiped on reboot.
+    pub fn isolated_data_dir() -> PathBuf {
+        match std::env::var_os("XDG_DATA_HOME").filter(|dir| !dir.is_empty()) {
+            Some(dir) => PathBuf::from(dir).join("lily2claude/opencode-data"),
+            None => crate::config::home_dir().join(".local/share/lily2claude/opencode-data"),
+        }
+    }
+
+    /// Isolate `cmd`'s opencode data directory, carrying the user's existing
+    /// auth token across so the provider does not fail with
+    /// "Authentication required".
+    ///
+    /// Both ACP spawn paths (the pooled session and the one-shot client) must
+    /// agree on this directory, otherwise they fight over the same SQLite file.
+    pub fn prepare_child_env(cmd: &mut tokio::process::Command) {
+        let data_dir = Self::isolated_data_dir();
+        let opencode_dir = data_dir.join("opencode");
+        let _ = std::fs::create_dir_all(&opencode_dir);
+
+        let src_auth = Self::auth_path();
+        let dst_auth = opencode_dir.join("auth.json");
+        if src_auth.exists()
+            && (!dst_auth.exists()
+                || std::fs::metadata(&src_auth).map(|m| m.len()).unwrap_or(0)
+                    != std::fs::metadata(&dst_auth).map(|m| m.len()).unwrap_or(0))
+        {
+            let _ = std::fs::copy(&src_auth, &dst_auth);
+        }
+
+        cmd.env("XDG_DATA_HOME", &data_dir);
+    }
 }
 
 #[async_trait]
