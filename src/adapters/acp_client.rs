@@ -215,7 +215,7 @@ impl AcpClient {
         stdin.write_all(format!("{}\n", prompt_req).as_bytes()).await?;
         stdin.flush().await?;
 
-        let is_debug = std::env::var_os("L2C_DEBUG_LOG").is_some();
+        let is_debug = crate::config::debug_enabled();
         let mut captured_usage: Option<TokenUsage> = None;
         let mut prompt_err = None;
 

@@ -97,7 +97,7 @@ pub async fn messages_handler(
         })
         .unwrap_or_default();
 
-    let is_debug = std::env::var_os("L2C_DEBUG_LOG").is_some();
+    let is_debug = crate::config::debug_enabled();
     if is_debug {
         let log_line = format!(
             "[ts={}] [REQ] is_compact={} model={} stream={} tools={:?} msgs={} last={}\n",
@@ -231,7 +231,7 @@ pub async fn messages_handler(
                             &tools_decl,
                         );
 
-                        let is_debug = std::env::var_os("L2C_DEBUG_LOG").is_some();
+                        let is_debug = crate::config::debug_enabled();
                         let mut stream = upstream_resp.bytes_stream();
                         'stream_loop: while let Some(item) = stream.next().await {
                             let events = match item {

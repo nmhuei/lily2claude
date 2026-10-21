@@ -153,13 +153,13 @@ impl Agent for OpenCodeAgent {
                     Ok(usage) => return Ok(usage),
                     Err(e) => {
                         let err_str = e.to_string();
-                        if std::env::var_os("L2C_DEBUG_LOG").is_some() {
+                        if crate::config::debug_enabled() {
                             eprintln!("[OpenCode execute_turn] attempt {} failed: {}", attempt, err_str);
                         }
                         mgr.evict_session(key, self.id()).await;
                         last_err = Some(e);
                         if crate::config::warp_pool::is_upstream_rate_limited(&err_str) {
-                            if std::env::var_os("L2C_DEBUG_LOG").is_some() {
+                            if crate::config::debug_enabled() {
                                 eprintln!("[OpenCode execute_turn] rate limited on attempt {}, failing over to next proxy: {}", attempt, err_str);
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;

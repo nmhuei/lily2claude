@@ -39,6 +39,21 @@ pub fn ensure_state_dir() -> PathBuf {
     dir
 }
 
+/// Is the opt-in debug log enabled?
+///
+/// Gates used to test `L2C_DEBUG_LOG` with `is_some()`, so `L2C_DEBUG_LOG=0`
+/// turned verbose stderr output on while [`debug_log_path`] still resolved the
+/// default file. One definition keeps the flag and the destination in sync.
+pub fn debug_enabled() -> bool {
+    match std::env::var_os("L2C_DEBUG_LOG") {
+        Some(value) if !value.is_empty() => {
+            let flag = value.to_string_lossy();
+            flag != "0" && !flag.eq_ignore_ascii_case("false")
+        }
+        _ => false,
+    }
+}
+
 /// Path of the opt-in request/response traffic log.
 ///
 /// `L2C_DEBUG_LOG` may name an explicit file; a bare flag (`1`, `true`, or an
@@ -147,8 +162,7 @@ impl Config {
         if local.exists() {
             return local;
         }
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        std::path::PathBuf::from(home).join(".config/lily2claude/config.toml")
+        home_dir().join(".config/lily2claude/config.toml")
     }
 
     pub fn load() -> Self {

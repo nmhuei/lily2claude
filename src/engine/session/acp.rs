@@ -70,7 +70,7 @@ impl AcpSession {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if std::env::var_os("L2C_DEBUG_LOG").is_some() {
+                if crate::config::debug_enabled() {
                     eprintln!("[ACP STDERR] {}", line);
                 }
             }
@@ -165,7 +165,7 @@ impl AcpSession {
         self.stdin.write_all(format!("{}\n", session_req).as_bytes()).await?;
         self.stdin.flush().await?;
 
-        let is_debug = std::env::var_os("L2C_DEBUG_LOG").is_some();
+        let is_debug = crate::config::debug_enabled();
         let session_new_res = tokio::time::timeout(Duration::from_secs(15), async {
             while let Some(line) = self.reader.next_line().await? {
                 if is_debug {

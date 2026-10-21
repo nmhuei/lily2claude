@@ -97,7 +97,7 @@ impl Agent for GenericAcpAgent {
                             || err_str.contains("OpenAI Chat tool call delta is missing id or name");
 
                         if rate_limited {
-                            if std::env::var_os("L2C_DEBUG_LOG").is_some() {
+                            if crate::config::debug_enabled() {
                                 eprintln!(
                                     "[GenericACP execute_turn] rate limited on attempt {}, retrying with another proxy",
                                     attempt
