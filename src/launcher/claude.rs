@@ -1,4 +1,4 @@
-use crate::discovery::catalog::CatalogRegistry;
+use crate::discovery::catalog::{CatalogRegistry, ALIAS_MODELS};
 use serde_json::json;
 use std::process::Command;
 
@@ -10,6 +10,33 @@ pub fn build_settings_json(model: &str, port: u16, context_tokens: u32) -> Strin
     } else {
         &l.anthropic_model
     };
+
+    // Same table as `GET /v1/models`, so the picker never offers an alias the
+    // router cannot resolve.
+    let picker_options: Vec<serde_json::Value> = ALIAS_MODELS
+        .iter()
+        .map(|m| {
+            json!({
+                "model": m.id,
+                "label": m.label,
+                "description": m.description,
+                "behavesAs": m.behaves_as,
+            })
+        })
+        .collect();
+
+    // Per-alias limits, keyed by the same ids as the picker.
+    let model_settings: serde_json::Map<String, serde_json::Value> = ALIAS_MODELS
+        .iter()
+        .map(|m| {
+            let mut entry = serde_json::Map::new();
+            entry.insert("autoCompactWindow".to_string(), json!(m.auto_compact_window));
+            if let Some(effort) = m.effort_level {
+                entry.insert("effortLevel".to_string(), json!(effort));
+            }
+            (m.id.to_string(), serde_json::Value::Object(entry))
+        })
+        .collect();
 
     json!({
         "env": {
@@ -40,62 +67,7 @@ pub fn build_settings_json(model: &str, port: u16, context_tokens: u32) -> Strin
             "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": "600000",
         },
         "modelPicker": {
-            "options": [
-                {
-                    "model": "deepseek",
-                    "label": "DeepSeek V4.1 Flash (deepseek)",
-                    "description": "DeepSeek V4.1 Flash Free via OpenCode (200k Context · Default Coding Model)",
-                    "behavesAs": "claude-sonnet-4-5"
-                },
-                {
-                    "model": "glm",
-                    "label": "GLM 5.3 Flash (glm)",
-                    "description": "GLM 5.3 Flash Free via OpenCode (200k Context · High Intelligence & Reasoning)",
-                    "behavesAs": "claude-sonnet-4-5"
-                },
-                {
-                    "model": "claude-haiku-4-5-20251001",
-                    "label": "Haiku 4.5 (haiku)",
-                    "description": "Claude Haiku 4.5 · Fast Subagent Engine (backed by Free DeepSeek/MiMo)",
-                    "behavesAs": "claude-haiku-4-5"
-                },
-                {
-                    "model": "mimo",
-                    "label": "MiMo V2.6 Flash (mimo)",
-                    "description": "Xiaomi MiMo V2.6 Flash Free via OpenCode (64k Context · Ultra Low Latency)",
-                    "behavesAs": "claude-haiku-4-5"
-                },
-                {
-                    "model": "nemotron",
-                    "label": "Nemotron 3 Nano (nemotron)",
-                    "description": "NVIDIA Nemotron 3 Free via OpenCode (1M Context · Large Codebase)",
-                    "behavesAs": "claude-opus-4-6"
-                },
-                {
-                    "model": "qwen",
-                    "label": "Qwen 3.6 Plus (qwen)",
-                    "description": "Alibaba Qwen 3.6 Plus Free via OpenCode (262k Context · Math & Code)",
-                    "behavesAs": "claude-sonnet-4-5"
-                },
-                {
-                    "model": "minimax",
-                    "label": "MiniMax M3 (minimax)",
-                    "description": "MiniMax M3 Free via OpenCode (200k Context · General Assistant)",
-                    "behavesAs": "claude-sonnet-4-5"
-                },
-                {
-                    "model": "kimi",
-                    "label": "Kimi K2.5 (kimi)",
-                    "description": "Moonshot Kimi K2.5 Free via OpenCode (262k Context · Long Context Agent)",
-                    "behavesAs": "claude-sonnet-4-5"
-                },
-                {
-                    "model": "kilo",
-                    "label": "Kilo Auto Free (kilo)",
-                    "description": "Kilo Auto Free Router (262k Context · Dynamic Multi-Provider)",
-                    "behavesAs": "claude-sonnet-4-5"
-                }
-            ],
+            "options": picker_options,
             "replaceBuiltInOptions": true
         },
         "skipDangerousModePermissionPrompt": true,
@@ -104,16 +76,7 @@ pub fn build_settings_json(model: &str, port: u16, context_tokens: u32) -> Strin
         "skipWorkflowUsageWarning": true,
         "autoCompactEnabled": true,
         "autoCompactWindow": context_tokens.saturating_mul(8) / 10,
-        "modelSettings": {
-            "deepseek": { "autoCompactWindow": 160000, "effortLevel": "high" },
-            "glm": { "autoCompactWindow": 160000, "effortLevel": "high" },
-            "mimo": { "autoCompactWindow": 50000 },
-            "nemotron": { "autoCompactWindow": 800000 },
-            "qwen": { "autoCompactWindow": 200000 },
-            "minimax": { "autoCompactWindow": 160000 },
-            "kimi": { "autoCompactWindow": 200000 },
-            "kilo": { "autoCompactWindow": 200000 }
-        }
+        "modelSettings": model_settings
     })
     .to_string()
 }
