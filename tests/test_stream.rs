@@ -235,3 +235,24 @@ fn test_sse_stream_hallucinated_tool_call_repair() {
     assert!(ev2.iter().any(|e| e.event == "message_delta" && e.data["delta"]["stop_reason"] == "tool_use"));
     assert!(ev2.iter().any(|e| e.event == "message_stop"));
 }
+
+#[test]
+fn test_sse_stream_partial_text_then_error_emits_error_not_end_turn() {
+    let mut engine = AnthropicStreamEngine::new("msg_test", "deepseek", 100, HashMap::new());
+    // Simulate model outputting partial text "Đang ho"
+    let ev1 = engine.feed_text("Đang ho");
+    assert!(ev1.iter().any(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "text"));
+    assert!(ev1.iter().any(|e| e.event == "content_block_delta" && e.data["delta"]["text"] == "Đang ho"));
+
+    // Now turn fails with a rate-limit / quota error
+    let err_events = engine.feed_error("Internal error: Free usage limit reached. provider.free-limit");
+
+    // Must emit content_block_stop to cleanly close the open text block
+    assert!(err_events.iter().any(|e| e.event == "content_block_stop"));
+    // Must emit error event with type "overloaded_error"
+    let err_ev = err_events.iter().find(|e| e.event == "error").expect("error event present");
+    assert_eq!(err_ev.data["error"]["type"], "overloaded_error");
+    // Must NEVER emit stop_reason: "end_turn"!
+    assert!(!err_events.iter().any(|e| e.event == "message_delta" && e.data["delta"]["stop_reason"] == "end_turn"));
+}
+
