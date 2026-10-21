@@ -17,6 +17,8 @@ pub fn is_upstream_rate_limited(text: &str) -> bool {
         || lower.contains("freetiererror")
         || lower.contains("quota exceeded")
         || lower.contains("usage limit")
+        || lower.contains("free-limit")
+        || lower.contains("free usage limit")
 }
 
 const HOT_RELOAD_SCRIPT: &str = include_str!("warp_rotate.sh");

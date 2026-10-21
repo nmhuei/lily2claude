@@ -649,14 +649,15 @@ pub async fn messages_handler(
                             _ => "Unknown error executing turn".to_string(),
                         };
                         if is_debug {
-                            eprintln!(">>> EXECUTE_TURN FAILED: {}. Emitting error message and cleanly finishing turn.", err_msg);
+                            eprintln!(">>> EXECUTE_TURN FAILED: {}. Emitting SSE error event (not assistant text).", err_msg);
                         }
-                        let err_events = streamer.engine.feed_text(&format!("\n\n⚠️ [{}]\n", err_msg));
+                        let err_events = streamer.engine.feed_error(&err_msg);
                         for ev in err_events {
                             let _ = sse_tx
                                 .send(Ok(Event::default().event(ev.event).data(ev.data.to_string())))
                                 .await;
                         }
+                        return;
                     }
                 }
 

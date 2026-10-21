@@ -133,6 +133,8 @@ fn test_is_upstream_rate_limited_detection() {
     assert!(is_upstream_rate_limited("HTTP 429 Too Many Requests"));
     assert!(is_upstream_rate_limited("Resource has been exhausted (e.g. check quota)."));
     assert!(is_upstream_rate_limited("FreeTierError: quota exceeded"));
+    assert!(is_upstream_rate_limited("provider.free-limit"));
+    assert!(is_upstream_rate_limited("Internal error: Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, or switch models."));
     assert!(!is_upstream_rate_limited("Hello, how can I help you today?"));
     assert!(!is_upstream_rate_limited("SyntaxError: unexpected token"));
 }

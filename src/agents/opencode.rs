@@ -46,7 +46,11 @@ impl OpenCodeAgent {
             let _ = std::fs::copy(&src_auth, &dst_auth);
         }
 
+        let state_dir = data_dir.join("state");
+        let _ = std::fs::create_dir_all(&state_dir);
+
         cmd.env("XDG_DATA_HOME", &data_dir);
+        cmd.env("XDG_STATE_HOME", &state_dir);
     }
 }
 
