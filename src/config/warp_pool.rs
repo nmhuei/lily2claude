@@ -179,8 +179,20 @@ struct WarpNode {
 }
 
 impl WarpNode {
+    /// Lock the runtime state, recovering a poisoned mutex.
+    ///
+    /// The guard only protects plain counters and timestamps, so a panic in
+    /// another thread cannot leave it half-written. `unwrap()` would instead
+    /// poison this node permanently and turn every later health check into a
+    /// panic, taking the whole proxy pool down over one unrelated failure.
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, NodeRuntimeState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn is_cooling(&self, now: Instant) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self.lock_state();
         state.cooldown_until.is_some_and(|until| until > now)
     }
 
@@ -189,7 +201,7 @@ impl WarpNode {
     /// `HTTP_PROXY` to a port nobody listens on, so every upstream request
     /// dies before it starts.
     fn is_known_bad(&self) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self.lock_state();
         state.last_ok.is_none() && state.probe_failures > 0
     }
 
@@ -461,7 +473,7 @@ impl WarpPool {
             return;
         };
         let should_rotate = {
-            let mut state = node.state.lock().unwrap();
+            let mut state = node.lock_state();
             state.failures = 0;
             state.probe_failures = 0;
             state.cooldown_until = None;
@@ -496,7 +508,7 @@ impl WarpPool {
         });
 
         let (failures, cooldown_secs) = {
-            let mut state = node.state.lock().unwrap();
+            let mut state = node.lock_state();
             state.failures = state.failures.saturating_add(1);
             let secs = compute_cooldown(base, state.failures);
             state.cooldown_until = Some(Instant::now() + Duration::from_secs(secs));
@@ -531,7 +543,7 @@ impl WarpPool {
     pub fn distinct_egress_ips(&self) -> usize {
         self.nodes
             .iter()
-            .filter_map(|node| node.state.lock().unwrap().egress_ip.clone())
+            .filter_map(|node| node.lock_state().egress_ip.clone())
             .collect::<HashSet<_>>()
             .len()
     }
@@ -542,7 +554,7 @@ impl WarpPool {
         self.nodes
             .iter()
             .map(|node| {
-                let state = node.state.lock().unwrap();
+                let state = node.lock_state();
                 let cooling = state.cooldown_until.is_some_and(|until| until > now);
                 (node.proxy_url.clone(), node.container.clone(), !cooling)
             })
@@ -554,7 +566,7 @@ impl WarpPool {
         self.nodes
             .iter()
             .map(|node| {
-                let state = node.state.lock().unwrap();
+                let state = node.lock_state();
                 let cooling = state.cooldown_until.is_some_and(|until| until > now);
                 let rotating = node.rotation_inflight.load(Ordering::Relaxed);
                 NodeStatus {
@@ -617,7 +629,7 @@ impl WarpPool {
             .nodes
             .iter()
             .filter_map(|node| {
-                let until = node.state.lock().unwrap().cooldown_until?;
+                let until = node.lock_state().cooldown_until?;
                 if until > now {
                     Some((until, node.clone()))
                 } else {
@@ -750,7 +762,7 @@ impl WarpPool {
         while Instant::now() < deadline {
             match probe_node(node, config).await {
                 Ok(egress_ip) => {
-                    let mut state = node.state.lock().unwrap();
+                    let mut state = node.lock_state();
                     state.cooldown_until = None;
                     state.failures = 0;
                     state.probe_failures = 0;
@@ -781,7 +793,7 @@ impl WarpPool {
                 error = %err,
                 "WARP node did not pass egress probe after rotation"
             );
-            let mut state = node.state.lock().unwrap();
+            let mut state = node.lock_state();
             state.last_error = Some(format!("probe after rotation: {err}"));
         }
         false
@@ -795,7 +807,7 @@ impl WarpPool {
         for node in &self.nodes {
             match probe_node(node, &self.config).await {
                 Ok(egress_ip) => {
-                    let mut state = node.state.lock().unwrap();
+                    let mut state = node.lock_state();
                     let now = Instant::now();
                     // A healthy tunnel does not clear an upstream 429: the IP
                     // is still rate-limited until its cooldown expires.
@@ -821,7 +833,7 @@ impl WarpPool {
                 }
                 Err(err) => {
                     let probe_failures = {
-                        let mut state = node.state.lock().unwrap();
+                        let mut state = node.lock_state();
                         state.probe_failures = state.probe_failures.saturating_add(1);
                         state.last_probe = Some(Instant::now());
                         state.last_error = Some(format!("probe: {err}"));

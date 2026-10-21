@@ -19,13 +19,24 @@ impl ProviderHealthRegistry {
         }
     }
 
+    /// Lock the trip table, recovering a poisoned mutex.
+    ///
+    /// Every write is an independent `(provider, expiry)` insertion, so a
+    /// poisoned guard cannot leave the table inconsistent. Panicking here would
+    /// instead make the router unusable for the rest of the daemon's life.
+    fn lock_tripped(&self) -> std::sync::MutexGuard<'_, HashMap<String, Instant>> {
+        self.tripped_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn mark_failed(&self, provider: &str, cooldown_secs: u64) {
-        let mut map = self.tripped_until.lock().unwrap();
+        let mut map = self.lock_tripped();
         map.insert(provider.to_string(), Instant::now() + Duration::from_secs(cooldown_secs));
     }
 
     pub fn is_healthy(&self, provider: &str) -> bool {
-        let mut map = self.tripped_until.lock().unwrap();
+        let mut map = self.lock_tripped();
         let now = Instant::now();
         map.retain(|_, expiry| *expiry > now);
         !map.contains_key(provider)
