@@ -9,7 +9,6 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 pub fn create_router(router: Arc<EngineRouter>) -> Router {
@@ -43,11 +42,15 @@ pub fn create_router(router: Arc<EngineRouter>) -> Router {
         .route("/v1/models", get(models_handler))
         .route("/v1/stats", get(stats_handler))
         .route("/v1/usage", get(stats_handler))
-        .route("/v1/usage/reset", post(reset_usage_handler).get(reset_usage_handler))
-        .route("/v1/reset", post(reset_usage_handler).get(reset_usage_handler))
+        // State-mutating endpoints are POST-only. Exposing them via GET let any
+        // page on the machine wipe the usage ledger with `<img src=...>`.
+        .route("/v1/usage/reset", post(reset_usage_handler))
+        .route("/v1/reset", post(reset_usage_handler))
         .route("/v1/messages/count_tokens", post(count_tokens_handler))
         .route("/v1/messages", post(messages_handler))
-        .layer(CorsLayer::permissive())
+        // No CORS layer: the only clients are the Claude Code CLI and `l2c`,
+        // which are not browsers. A permissive policy made this local server
+        // reachable from any web page the user had open.
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
