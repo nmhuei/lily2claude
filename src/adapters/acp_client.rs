@@ -108,7 +108,7 @@ impl AcpClient {
             }
         });
         stdin.write_all(format!("{}\n", init_req).as_bytes()).await?;
-        let init_res = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let init_res = tokio::time::timeout(std::time::Duration::from_secs(35), async {
             while let Some(line) = reader.next_line().await? {
                 if let Ok(v) = serde_json::from_str::<Value>(&line) {
                     if v.get("id").and_then(|id| id.as_u64()) == Some(1) {

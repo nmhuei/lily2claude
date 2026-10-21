@@ -90,7 +90,7 @@ impl AcpSession {
 
         let mut reader = BufReader::new(stdout).lines();
 
-        // 1. initialize with 10-second timeout to prevent deadlocks
+        // 1. initialize with 35-second timeout to allow cold daemon initialization
         let init_req = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -104,7 +104,7 @@ impl AcpSession {
         stdin.write_all(format!("{}\n", init_req).as_bytes()).await?;
         stdin.flush().await?;
 
-        let init_res = tokio::time::timeout(Duration::from_secs(10), async {
+        let init_res = tokio::time::timeout(Duration::from_secs(35), async {
             while let Some(line) = reader.next_line().await? {
                 if let Ok(val) = serde_json::from_str::<Value>(&line) {
                     if val.get("id").and_then(|id| id.as_u64()) == Some(1) {
