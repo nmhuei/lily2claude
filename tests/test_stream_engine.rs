@@ -232,11 +232,40 @@ fn test_cancel_and_upstream_error_terminate() {
     let q_events = quota_errored.feed_error("Internal error: Free usage limit reached. provider.free-limit");
     let q_err = q_events.iter().find(|e| e.event == "error").expect("error event present");
     assert_eq!(q_err.data["error"]["type"], "overloaded_error");
+    // Pre-stream error must NEVER emit message_start (otherwise Claude Code treats it as mid-stream failure)
+    assert!(!q_events.iter().any(|e| e.event == "message_start"));
 
     let mut rate_errored = AnthropicStreamEngine::new("msg_rate", "deepseek", 10, HashMap::new());
     let r_events = rate_errored.feed_error("upstream 429 Too Many Requests");
     let r_err = r_events.iter().find(|e| e.event == "error").expect("error event present");
     assert_eq!(r_err.data["error"]["type"], "overloaded_error");
+    assert!(!r_events.iter().any(|e| e.event == "message_start"));
+}
+
+#[test]
+fn test_thinking_only_turn_opens_blocks_and_finishes_cleanly() {
+    let mut engine = AnthropicStreamEngine::new("msg_think", "deepseek", 100, HashMap::new());
+    assert!(!engine.tracker.has_any_blocks_ever_opened());
+
+    let think_events = engine.feed_thinking("Exploring the solution space...");
+    assert!(think_events.iter().any(|e| e.event == "message_start"));
+    assert!(think_events.iter().any(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"));
+    assert!(engine.tracker.has_any_blocks_ever_opened());
+
+    let finish_events = engine.finish_with_reason(
+        lily2claude::protocol::stream::engine::FinishReason::EndTurn,
+        100,
+        50,
+        0,
+    );
+    // Must close thinking with signature_delta and content_block_stop
+    assert!(finish_events.iter().any(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"));
+    assert!(finish_events.iter().any(|e| e.event == "content_block_stop"));
+    // Must emit end_turn and message_stop
+    assert!(finish_events.iter().any(|e| e.event == "message_delta" && e.data["delta"]["stop_reason"] == "end_turn"));
+    assert!(finish_events.iter().any(|e| e.event == "message_stop"));
+    // Must NOT contain error event
+    assert!(!finish_events.iter().any(|e| e.event == "error"));
 }
 
 #[test]

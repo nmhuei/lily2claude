@@ -529,19 +529,10 @@ pub async fn messages_handler(
                 .with_tools(&tools_decl);
                 let mut streamer = AcpStreamAdapter::new(engine);
 
-                // Send message_start immediately so Claude Code receives HTTP 200 OK headers and enters streaming mode
-                let start_ev = streamer.engine.start();
-                if sse_tx
-                    .send(Ok(Event::default()
-                        .event(start_ev.event)
-                        .data(start_ev.data.to_string())))
-                    .await
-                    .is_err()
-                {
-                    exec_task.abort();
-                    session_mgr_stream.evict_session(&s_key_clone, &provider_name).await;
-                    return;
-                }
+                // Note: We do NOT emit message_start eagerly here.
+                // StreamEngine lazily emits message_start via ensure_started() upon the first chunk.
+                // This guarantees that any early error (rate limits, timeouts) is emitted as a clean
+                // pre-response error without a prior message_start, allowing Claude Code to auto-retry.
 
                 let mut captured_usage: Option<crate::protocol::tokens::TokenUsage> = None;
 
@@ -637,9 +628,13 @@ pub async fn messages_handler(
 
                 if !is_turn_ok {
                     session_mgr_stream.evict_session(&s_key_clone, &provider_name).await;
-                    if streamer.engine.emitted_tool_count > 0 {
+                    let has_substantive_output = streamer.engine.emitted_tool_count > 0
+                        || streamer.engine.has_emitted_text_block
+                        || !streamer.engine.accumulated_text().trim().is_empty();
+
+                    if has_substantive_output {
                         if is_debug {
-                            eprintln!(">>> EXECUTE_TURN FAILED/TIMED OUT after emitting tools: {:?}. Gracefully finishing turn so client can proceed.", exec_res);
+                            eprintln!(">>> EXECUTE_TURN FAILED/TIMED OUT after emitting content: {:?}. Gracefully finishing turn so client can proceed.", exec_res);
                         }
                     } else {
                         let err_msg = match &exec_res {
@@ -649,7 +644,7 @@ pub async fn messages_handler(
                             _ => "Unknown error executing turn".to_string(),
                         };
                         if is_debug {
-                            eprintln!(">>> EXECUTE_TURN FAILED: {}. Emitting SSE error event (not assistant text).", err_msg);
+                            eprintln!(">>> EXECUTE_TURN FAILED before content: {}. Emitting SSE error event (not assistant text).", err_msg);
                         }
                         let err_events = streamer.engine.feed_error(&err_msg);
                         for ev in err_events {
@@ -661,17 +656,17 @@ pub async fn messages_handler(
                     }
                 }
 
-                // If turn completed without errors but emitted 0 tools AND 0 visible text (and not compaction),
-                // the upstream agent produced an empty turn (e.g. abrupt EOF or dropped stream).
-                // Do NOT emit an empty assistant message with end_turn — that causes Claude Code to inject
-                // "[Your previous response had no visible output]" and eventually fail subagents!
+                // If turn completed without errors but emitted 0 tools, 0 visible text, AND no blocks were ever opened (and not compaction),
+                // the upstream agent produced a genuinely empty turn (e.g. abrupt EOF before any tokens).
+                // Note: If blocks were ever opened (e.g. a thinking block was streamed), it is NOT an empty turn.
                 if streamer.engine.emitted_tool_count == 0
                     && streamer.engine.accumulated_text().trim().is_empty()
                     && streamer.engine.text_buffer.trim().is_empty()
+                    && !streamer.engine.tracker.has_any_blocks_ever_opened()
                     && !is_compact
                 {
                     if is_debug {
-                        eprintln!(">>> EXECUTE_TURN completed with 0 tools and 0 text. Emitting SSE error so client retries cleanly.");
+                        eprintln!(">>> EXECUTE_TURN completed with 0 tools and 0 content blocks. Emitting SSE error so client retries cleanly.");
                     }
                     session_mgr_stream.evict_session(&s_key_clone, &provider_name).await;
                     let err_events = streamer.engine.feed_error("Upstream agent returned empty response without text or tools");

@@ -369,9 +369,10 @@ impl AnthropicStreamEngine {
             return Vec::new();
         }
         let mut events = Vec::new();
-        if let Some(start) = self.ensure_started() {
-            events.push(start);
-        }
+        // Do NOT call ensure_started() here!
+        // If the stream hasn't started yet, emitting message_start immediately before
+        // error causes Claude Code to classify the error as a mid-stream crash instead
+        // of a retryable request-level error.
         for (kind, idx) in self.tracker.close_all() {
             if kind == "thinking" {
                 events.push(self.signature_delta(idx));
