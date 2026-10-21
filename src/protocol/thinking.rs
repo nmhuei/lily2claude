@@ -44,10 +44,13 @@ impl ThinkingRouter {
             }
 
             let (part, rest) = split_utf8_prefix(remaining, room);
-            if !part.is_empty() {
-                items.push(ThinkingRouteItem::Thinking(part.to_string()));
-                self.thinking_block_bytes += part.len();
+            if part.is_empty() {
+                items.push(ThinkingRouteItem::SegmentBreak);
+                self.thinking_block_bytes = 0;
+                continue;
             }
+            items.push(ThinkingRouteItem::Thinking(part.to_string()));
+            self.thinking_block_bytes += part.len();
             remaining = rest;
 
             if self.thinking_block_bytes >= THINKING_RENDER_CHUNK_BYTES {
@@ -239,6 +242,19 @@ mod tests {
         let items = router.process_thinking(&big_chunk);
 
         // Should contain a SegmentBreak after 16KB
+        let has_break = items.iter().any(|item| matches!(item, ThinkingRouteItem::SegmentBreak));
+        assert!(has_break);
+    }
+
+    #[test]
+    fn test_multibyte_utf8_at_segment_boundary_does_not_infinite_loop() {
+        let mut router = ThinkingRouter::new();
+        // Leave 2 bytes remaining before 16KB
+        router.thinking_block_bytes = THINKING_RENDER_CHUNK_BYTES - 2;
+        // 3-byte Vietnamese character 'ế' followed by more text
+        let chunk = "ế và đang suy nghĩ kiểm tra";
+        let items = router.process_thinking(chunk);
+        assert!(!items.is_empty());
         let has_break = items.iter().any(|item| matches!(item, ThinkingRouteItem::SegmentBreak));
         assert!(has_break);
     }

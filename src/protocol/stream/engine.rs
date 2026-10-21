@@ -476,7 +476,13 @@ impl AnthropicStreamEngine {
 
         let mut remaining = fragment;
         while !remaining.is_empty() {
-            let (sub, rest) = split_utf8_prefix(remaining, RENDER_DELTA_CHUNK_BYTES);
+            let (mut sub, mut rest) = split_utf8_prefix(remaining, RENDER_DELTA_CHUNK_BYTES);
+            if sub.is_empty() {
+                let next_idx = remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(remaining.len());
+                let (s, r) = remaining.split_at(next_idx);
+                sub = s;
+                rest = r;
+            }
             remaining = rest;
             let est = (sub.len() / 4).max(1);
             events.push(SseEvent::new(
@@ -623,7 +629,13 @@ impl AnthropicStreamEngine {
 
         let mut remaining = actual_text.as_str();
         while !remaining.is_empty() {
-            let (sub, rest) = split_utf8_prefix(remaining, RENDER_DELTA_CHUNK_BYTES);
+            let (mut sub, mut rest) = split_utf8_prefix(remaining, RENDER_DELTA_CHUNK_BYTES);
+            if sub.is_empty() {
+                let next_idx = remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(remaining.len());
+                let (s, r) = remaining.split_at(next_idx);
+                sub = s;
+                rest = r;
+            }
             remaining = rest;
             events.push(SseEvent::new(
                 "content_block_delta",
