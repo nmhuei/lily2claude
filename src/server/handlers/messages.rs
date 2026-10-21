@@ -637,9 +637,9 @@ pub async fn messages_handler(
 
                 if !is_turn_ok {
                     session_mgr_stream.evict_session(&s_key_clone, &provider_name).await;
-                    if streamer.engine.emitted_tool_count > 0 || !streamer.engine.text_buffer.trim().is_empty() {
+                    if streamer.engine.emitted_tool_count > 0 {
                         if is_debug {
-                            eprintln!(">>> EXECUTE_TURN FAILED/TIMED OUT after emitting content: {:?}. Gracefully finishing turn so client can proceed.", exec_res);
+                            eprintln!(">>> EXECUTE_TURN FAILED/TIMED OUT after emitting tools: {:?}. Gracefully finishing turn so client can proceed.", exec_res);
                         }
                     } else {
                         let err_msg = match &exec_res {
