@@ -22,7 +22,10 @@ impl SessionManager {
     pub fn new() -> Self {
         let warp_pool = if std::env::var_os("L2C_DISABLE_WARP").is_none() {
             let config = crate::config::Config::load();
-            if config.warp.require_warp || !config.warp.nodes.is_empty() {
+            // `require_warp` is the switch. The node list alone must not force
+            // proxying: nodes default to a non-empty list, so `||` here made
+            // `require_warp = false` impossible to honour.
+            if config.warp.require_warp && !config.warp.nodes.is_empty() {
                 Some(Arc::new(crate::config::warp_pool::WarpPool::from_config(
                     &config.warp,
                 )))

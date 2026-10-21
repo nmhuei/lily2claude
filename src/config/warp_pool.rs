@@ -22,18 +22,13 @@ pub fn is_upstream_rate_limited(text: &str) -> bool {
 const HOT_RELOAD_SCRIPT: &str = include_str!("warp_rotate.sh");
 const MAX_COOLDOWN_SECS: u64 = 900;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ContainerRuntime {
+    #[default]
     Auto,
     Docker,
     Podman,
-}
-
-impl Default for ContainerRuntime {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +182,15 @@ impl WarpNode {
     fn is_cooling(&self, now: Instant) -> bool {
         let state = self.state.lock().unwrap();
         state.cooldown_until.is_some_and(|until| until > now)
+    }
+
+    /// A node that has never once answered a probe but has failed one is a
+    /// dead proxy, not a rate-limited one. Handing it to a child process sets
+    /// `HTTP_PROXY` to a port nobody listens on, so every upstream request
+    /// dies before it starts.
+    fn is_known_bad(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.last_ok.is_none() && state.probe_failures > 0
     }
 
     fn runtime_variants(&self) -> Vec<ContainerRuntime> {
@@ -372,14 +376,21 @@ impl WarpPool {
         let mut healthy = Vec::new();
         for offset in 0..total {
             let node = &self.nodes[(start + offset) % total];
-            if !node.is_cooling(now) && !node.rotation_inflight.load(Ordering::Relaxed) {
+            if !node.is_cooling(now)
+                && !node.rotation_inflight.load(Ordering::Relaxed)
+                && !node.is_known_bad()
+            {
                 healthy.push(node.proxy_url.clone());
             }
         }
 
         if healthy.is_empty() {
+            // Last resort: a node that used to work and is merely cooling is
+            // still worth retrying. A node that never worked is not.
             if let Some(node) = self.earliest_expiry_node() {
-                healthy.push(node.proxy_url.clone());
+                if !node.is_known_bad() {
+                    healthy.push(node.proxy_url.clone());
+                }
             }
             self.trigger_auto_heal();
         }
