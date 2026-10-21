@@ -399,9 +399,14 @@ pub async fn messages_handler(
                             }));
                         }
 
+                        // Same reason as the streaming path: Claude Code indexes
+                        // history by `message.id`, so a constant id makes every
+                        // later turn collapse into the first one.
+                        let message_id = next_message_id("msg_non_stream");
+
                         let has_tools = !valid_calls.is_empty();
                         for (idx, valid) in valid_calls.into_iter().enumerate() {
-                            let call_id = format!("call_acp_nonstream_{}", idx);
+                            let call_id = format!("call_acp_{}_{}", message_id, idx);
                             content_blocks.push(json!({
                                 "type": "tool_use",
                                 "id": call_id,
@@ -420,7 +425,7 @@ pub async fn messages_handler(
                         let stop_reason = if has_tools { "tool_use" } else { "end_turn" };
 
                         return Json(json!({
-                            "id": "msg_non_stream",
+                            "id": message_id,
                             "type": "message",
                             "role": "assistant",
                             "model": req.model,
