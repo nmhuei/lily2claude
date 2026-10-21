@@ -130,7 +130,7 @@ impl AcpClient {
 
         // 2. session/new
         let mut cwd = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("/home/light"))
+            .unwrap_or_else(|_| crate::config::home_dir())
             .to_string_lossy()
             .to_string();
 

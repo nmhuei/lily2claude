@@ -10,8 +10,7 @@ pub struct ClineAgent;
 
 impl ClineAgent {
     pub fn providers_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/light".to_string());
-        Path::new(&home).join(".cline/data/settings/providers.json")
+        crate::config::home_dir().join(".cline/data/settings/providers.json")
     }
 }
 

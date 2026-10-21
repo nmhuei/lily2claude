@@ -10,13 +10,11 @@ pub struct CommandCodeAgent;
 
 impl CommandCodeAgent {
     pub fn auth_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/light".to_string());
-        Path::new(&home).join(".commandcode/auth.json")
+        crate::config::home_dir().join(".commandcode/auth.json")
     }
 
     pub fn catalog_dir() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/light".to_string());
-        Path::new(&home).join(".commandcode/cache/model-catalog/v1")
+        crate::config::home_dir().join(".commandcode/cache/model-catalog/v1")
     }
 }
 

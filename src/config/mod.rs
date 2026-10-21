@@ -3,6 +3,81 @@ pub mod warp_pool;
 use crate::config::warp_pool::WarpConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+/// Best-effort home directory of the user running the daemon.
+///
+/// Never hardcode a developer's `$HOME`: the same binary has to resolve its
+/// own agent paths on any machine. Falls back to the process temp directory
+/// when `$HOME` is unset (containers, stripped-down shells).
+pub fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Per-user directory for runtime state (pid files, daemon logs, traffic logs).
+///
+/// Deliberately outside `/tmp`: on most distros `/tmp` is a tmpfs, so anything
+/// written there costs RAM and vanishes on reboot (or gets wiped mid-session
+/// while the daemon still holds the file open).
+pub fn state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("LILY2CLAUDE_STATE_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir).join("lily2claude");
+    }
+    home_dir().join(".local/state/lily2claude")
+}
+
+/// [`state_dir`], created on demand.
+pub fn ensure_state_dir() -> PathBuf {
+    let dir = state_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Path of the opt-in request/response traffic log.
+///
+/// `L2C_DEBUG_LOG` may name an explicit file; a bare flag (`1`, `true`, or an
+/// empty value) falls back to the state directory instead of a fixed path in
+/// a world-writable temp directory.
+pub fn debug_log_path() -> PathBuf {
+    match std::env::var_os("L2C_DEBUG_LOG") {
+        Some(value) if !value.is_empty() && value != "1" && value != "true" => PathBuf::from(value),
+        _ => state_dir().join("traffic.log"),
+    }
+}
+
+/// Open a file for appending, creating it owner-only (0600 on Unix).
+///
+/// Debug logs carry full prompt and response text, so they must not be
+/// world-readable in a shared temp directory.
+pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// Create or truncate a file owner-only (0600 on Unix).
+pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(contents)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
@@ -177,7 +252,12 @@ impl Config {
                 kind: "acp_stdio".to_string(),
                 endpoint: None,
                 command: Some(vec!["opencode".to_string(), "acp".to_string()]),
-                auth_file: Some("/home/light/.local/share/opencode/auth.json".to_string()),
+                auth_file: Some(
+                    home_dir()
+                        .join(".local/share/opencode/auth.json")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
                 auth_token: None,
                 warp_proxies: None,
             },
@@ -189,7 +269,12 @@ impl Config {
                 kind: "acp_stdio".to_string(),
                 endpoint: None,
                 command: Some(vec!["commandcode".to_string(), "acp".to_string()]),
-                auth_file: Some("/home/light/.commandcode/auth.json".to_string()),
+                auth_file: Some(
+                    home_dir()
+                        .join(".commandcode/auth.json")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
                 auth_token: None,
                 warp_proxies: None,
             },
@@ -213,7 +298,12 @@ impl Config {
                 kind: "acp_stdio".to_string(),
                 endpoint: None,
                 command: Some(vec!["cline".to_string(), "--acp".to_string()]),
-                auth_file: Some("/home/light/.cline/data/settings/providers.json".to_string()),
+                auth_file: Some(
+                    home_dir()
+                        .join(".cline/data/settings/providers.json")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
                 auth_token: None,
                 warp_proxies: None,
             },

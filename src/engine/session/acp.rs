@@ -151,7 +151,7 @@ impl AcpSession {
         self.rpc_id += 1;
         let session_call_id = self.rpc_id;
         let mut cwd = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("/home/light"))
+            .unwrap_or_else(|_| crate::config::home_dir())
             .to_string_lossy()
             .to_string();
 
@@ -265,7 +265,10 @@ impl AcpSession {
         }
 
         if is_debug {
-            let _ = std::fs::write("/tmp/last_acp_prompt.txt", prompt);
+            let _ = crate::config::write_private(
+                &crate::config::ensure_state_dir().join("last_acp_prompt.txt"),
+                prompt.as_bytes(),
+            );
         }
         let mut captured_usage: Option<crate::protocol::tokens::TokenUsage> = None;
         let mut prompt_err = None;
@@ -335,7 +338,8 @@ impl AcpSession {
             if is_debug {
                 let cut = line.floor_char_boundary(line.len().min(120));
                 eprintln!("[ACP prompt raw] {}", &line[..cut]);
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/acp_raw.log") {
+                let raw_log = crate::config::ensure_state_dir().join("acp_raw.log");
+                if let Ok(mut f) = crate::config::open_private_append(&raw_log) {
                     use std::io::Write;
                     let _ = writeln!(f, "{}", line);
                 }

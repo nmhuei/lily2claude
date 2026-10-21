@@ -10,8 +10,7 @@ pub struct OpenCodeAgent;
 
 impl OpenCodeAgent {
     pub fn auth_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/light".to_string());
-        Path::new(&home).join(".local/share/opencode/auth.json")
+        crate::config::home_dir().join(".local/share/opencode/auth.json")
     }
 }
 

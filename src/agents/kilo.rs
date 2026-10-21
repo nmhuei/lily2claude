@@ -21,13 +21,11 @@ impl Default for KiloAgent {
 
 impl KiloAgent {
     pub fn cache_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/light".to_string());
-        Path::new(&home).join(".cache/kilo/models.json")
+        crate::config::home_dir().join(".cache/kilo/models.json")
     }
 
     pub fn config_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/light".to_string());
-        Path::new(&home).join(".config/kilo/kilo.jsonc")
+        crate::config::home_dir().join(".config/kilo/kilo.jsonc")
     }
 }
 

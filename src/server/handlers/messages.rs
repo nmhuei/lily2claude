@@ -104,11 +104,7 @@ pub async fn messages_handler(
             now, is_compact, req.model, req.stream, tools_summary, req.messages.len(), last_preview
         );
         eprint!("{}", log_line);
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/lily2claude_traffic.log")
-        {
+        if let Ok(mut f) = crate::config::open_private_append(&crate::config::debug_log_path()) {
             use std::io::Write;
             let _ = f.write_all(log_line.as_bytes());
         }
@@ -206,10 +202,7 @@ pub async fn messages_handler(
                                 now, target.provider, target.model, status, body.replace('\n', " ")
                             );
                             eprint!("{}", fail_line);
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open("/tmp/lily2claude_traffic.log")
+                            if let Ok(mut f) = crate::config::open_private_append(&crate::config::debug_log_path())
                             {
                                 use std::io::Write;
                                 let _ = f.write_all(fail_line.as_bytes());
@@ -258,10 +251,7 @@ pub async fn messages_handler(
                                         let tool_name = ev.data["content_block"]["name"].as_str().unwrap_or("unknown");
                                         let tool_id = ev.data["content_block"]["id"].as_str().unwrap_or("unknown");
                                         let t_log = format!("[ts={}] [SSE_TOOL] name={} id={}\n", now, tool_name, tool_id);
-                                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                                            .create(true)
-                                            .append(true)
-                                            .open("/tmp/lily2claude_traffic.log")
+                                        if let Ok(mut f) = crate::config::open_private_append(&crate::config::debug_log_path())
                                         {
                                             use std::io::Write;
                                             let _ = f.write_all(t_log.as_bytes());
@@ -276,10 +266,7 @@ pub async fn messages_handler(
                                     {
                                         let args = ev.data["delta"]["partial_json"].as_str().unwrap_or("");
                                         let a_log = format!("[ts={}] [SSE_TOOL_INPUT] {}\n", now, args.replace('\n', " "));
-                                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                                            .create(true)
-                                            .append(true)
-                                            .open("/tmp/lily2claude_traffic.log")
+                                        if let Ok(mut f) = crate::config::open_private_append(&crate::config::debug_log_path())
                                         {
                                             use std::io::Write;
                                             let _ = f.write_all(a_log.as_bytes());

@@ -1,15 +1,14 @@
-use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tracing::info;
 
 pub fn pid_file_path(port: u16) -> PathBuf {
-    PathBuf::from(format!("/tmp/lily2claude_{}.pid", port))
+    crate::config::ensure_state_dir().join(format!("lily2claude_{}.pid", port))
 }
 
 pub fn log_file_path() -> PathBuf {
-    PathBuf::from("/tmp/lily2claude_daemon.log")
+    crate::config::ensure_state_dir().join("daemon.log")
 }
 
 pub fn is_server_listening(port: u16) -> bool {
@@ -69,10 +68,7 @@ pub fn start_daemon(port: u16, verbose: bool) -> anyhow::Result<u32> {
     }
 
     let exe = std::env::current_exe().unwrap_or_else(|_| "lily2claude".into());
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file_path());
+    let log_file = crate::config::open_private_append(&log_file_path());
 
     let (stdout_cfg, stderr_cfg) = match log_file {
         Ok(file) => {
