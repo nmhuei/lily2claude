@@ -63,10 +63,13 @@ pub fn is_compaction_text(text: &str) -> bool {
 
     let lower = text.to_ascii_lowercase();
 
-    // Explicit markers emitted by known Claude Code / OpenCode versions.
+    // Explicit markers emitted by Claude Code (extracted directly from runtime bundle v2.1.306):
     if lower.contains("your summary should include the following sections:")
-        || (lower.contains("primary request and intent:") && lower.contains("key technical concepts:"))
         || (lower.contains("reminder: do not call any tools") && lower.contains("summary"))
+        || lower.contains("tool calls will be rejected and you will fail the task")
+        || lower.contains("your task is to create a detailed summary of this conversation")
+        || lower.contains("your task is to create a concise summary of the conversation")
+        || (lower.contains("primary request and intent:") && lower.contains("key technical concepts:"))
         || lower.contains("free up context by summarizing the conversation")
         || lower.contains("you are compacting the conversation")
     {
