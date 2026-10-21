@@ -19,9 +19,15 @@ pub struct MessagesRequest {
 
 impl MessagesRequest {
     pub fn is_compaction_request(&self) -> bool {
+        // Compaction summarizes prior turns. A single-message prompt (e.g. subagent initialization)
+        // has no conversation history to compact.
+        if self.messages.len() < 2 {
+            return false;
+        }
+
         // A compaction request MUST ONLY be detected on the CURRENT turn (the last user message).
-        // NEVER check system instructions, historical messages, or assistant responses,
-        // otherwise subsequent normal turns will get stuck in an infinite compaction/summary loop!
+        // NEVER check historical messages or assistant responses, otherwise subsequent normal
+        // turns will get stuck in an infinite compaction/summary loop!
         if let Some(last_msg) = self.messages.last() {
             if last_msg.role == "user" {
                 match &last_msg.content {
@@ -48,6 +54,13 @@ impl MessagesRequest {
 }
 
 pub fn is_compaction_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    // NEVER mistake Claude Code system reminders (such as skills catalogues or git status)
+    // injected into user blocks for compaction instructions!
+    if trimmed.starts_with("<system-reminder>") || trimmed.starts_with("<system-instructions>") {
+        return false;
+    }
+
     let lower = text.to_ascii_lowercase();
 
     // Explicit markers emitted by known Claude Code / OpenCode versions.
@@ -60,15 +73,15 @@ pub fn is_compaction_text(text: &str) -> bool {
         return true;
     }
 
-    // Structural fallback for prompt revisions we have not seen yet: a long
-    // instruction asking for a compacted summary of the context. The length
-    // gate keeps ordinary "summarize this file" requests (which arrive with a
-    // tool catalog) from being mistaken for compaction.
-    let asks_to_summarize = lower.contains("summariz") || lower.contains("compact");
-    let summary_scope = lower.contains("conversation")
-        || lower.contains("context")
-        || lower.contains("transcript");
-    asks_to_summarize && summary_scope && text.len() >= 300
+    // Structural fallback for prompt revisions: MUST be explicitly asking to compact/summarize
+    // the conversation history, not just ordinary instructions mentioning "context".
+    let asks_to_compact = (lower.contains("summariz") || lower.contains("compact"))
+        && (lower.contains("conversation history")
+            || lower.contains("conversation so far")
+            || lower.contains("entire conversation")
+            || lower.contains("chat history")
+            || lower.contains("previous messages"));
+    asks_to_compact
 }
 
 fn default_max_tokens() -> u32 {

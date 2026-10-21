@@ -188,3 +188,38 @@ async fn test_turn_after_compaction_is_not_compaction() {
     assert!(!prompt.contains("[COMPACTION DIRECTIVE]"), "Compaction directive must NOT be injected on normal turn");
 }
 
+#[test]
+fn test_subagent_with_system_reminders_is_not_compaction() {
+    let req = MessagesRequest {
+        model: "deepseek".to_string(),
+        system: None,
+        tools: Some(vec![AnthropicTool {
+            name: "Bash".to_string(),
+            description: Some("Run bash command".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            ..Default::default()
+        }]),
+        messages: vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "<system-reminder>\nThe following skills are available:\n- superpowers: Use when starting any conversation\n- summarizer: generate/summarize/extract/classify code\n</system-reminder>".to_string(),
+                    },
+                    ContentBlock::Text {
+                        text: "Read-only task in /home/light/GitHub/ds2api. Grep and read files.".to_string(),
+                    },
+                ]),
+            },
+        ],
+        stream: true,
+        max_tokens: 4096,
+        temperature: None,
+    };
+
+    assert!(!req.is_compaction_request(), "Subagent turn 1 with skills reminder must NOT be detected as compaction");
+    let prompt = build_acp_prompt(&req);
+    assert!(prompt.contains("[Tools Instruction]"), "Tools instruction MUST be present for subagent");
+    assert!(!prompt.contains("[COMPACTION DIRECTIVE]"), "Compaction directive MUST NOT be present for subagent");
+}
+
