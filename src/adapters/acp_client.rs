@@ -36,7 +36,8 @@ impl AcpClient {
         // Isolate opencode data directory, but preserve existing auth token so the provider
         // doesn't fail with "Authentication required".
         if self.command[0].contains("opencode") {
-            let data_dir = std::path::Path::new("/tmp/lily_opencode_data");
+            // See AcpSession::spawn: keep opencode's SQLite data off tmpfs.
+            let data_dir = std::env::temp_dir().join("lily2claude_opencode_data");
             let opencode_dir = data_dir.join("opencode");
             let _ = std::fs::create_dir_all(&opencode_dir);
             let src_auth = crate::agents::opencode::OpenCodeAgent::auth_path();
@@ -48,7 +49,7 @@ impl AcpClient {
             {
                 let _ = std::fs::copy(&src_auth, &dst_auth);
             }
-            cmd.env("XDG_DATA_HOME", "/tmp/lily_opencode_data");
+            cmd.env("XDG_DATA_HOME", &data_dir);
 
             let proxy = if let Ok(p) = std::env::var("L2C_PROXY") {
                 Some(p)

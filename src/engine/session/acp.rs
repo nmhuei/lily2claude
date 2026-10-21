@@ -41,7 +41,9 @@ impl AcpSession {
         // Isolate opencode data directory, but preserve existing auth token so the provider
         // doesn't fail with "Authentication required".
         if command[0].contains("opencode") {
-            let data_dir = std::path::Path::new("/tmp/lily_opencode_data");
+            // Not /tmp: that is tmpfs (RAM) on most distros, and opencode keeps
+            // a SQLite database here. Use the platform temp dir so TMPDIR wins.
+            let data_dir = std::env::temp_dir().join("lily2claude_opencode_data");
             let opencode_dir = data_dir.join("opencode");
             let _ = std::fs::create_dir_all(&opencode_dir);
             let src_auth = crate::agents::opencode::OpenCodeAgent::auth_path();
@@ -53,7 +55,7 @@ impl AcpSession {
             {
                 let _ = std::fs::copy(&src_auth, &dst_auth);
             }
-            cmd.env("XDG_DATA_HOME", "/tmp/lily_opencode_data");
+            cmd.env("XDG_DATA_HOME", &data_dir);
         }
 
         if let Some(ref pool) = warp_pool {
