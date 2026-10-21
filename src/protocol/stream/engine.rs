@@ -836,8 +836,15 @@ impl AnthropicStreamEngine {
             json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                // The real API reports the final input/cache figures here as well
+                // as in message_start.  Omitting them made clients reconcile
+                // against the message_start values, which are seeded before the
+                // provider has reported anything.
                 "usage": {
-                    "output_tokens": output_tokens
+                    "input_tokens": self.input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": self.cached_read_tokens
                 }
             }),
         ));

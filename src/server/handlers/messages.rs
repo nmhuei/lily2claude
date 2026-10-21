@@ -42,20 +42,15 @@ pub async fn messages_handler(
     let calculated_input_tokens = crate::protocol::tokens::TokenCalculator::count_request_tokens(&req) as u64;
     let is_compact = req.is_compaction_request();
 
-    // High-precision prompt cache calculation:
-    // In multi-turn dialogues, prior conversation turns serve as the cached prompt prefix,
-    // and only the latest turn (user prompt + tool results) constitutes fresh input tokens.
-    let (initial_input_tokens, initial_cached_tokens) = if req.messages.len() > 1 {
-        let last_msg_tokens = req
-            .messages
-            .last()
-            .map(|m| crate::protocol::tokens::TokenCalculator::count_message(m) as u64)
-            .unwrap_or(calculated_input_tokens);
-        let cached = calculated_input_tokens.saturating_sub(last_msg_tokens);
-        (last_msg_tokens.max(1), cached)
-    } else {
-        (calculated_input_tokens.max(1), 0)
-    };
+    // `input_tokens` must describe the prompt the model actually receives: system
+    // prompt + tool catalog + every message.  It used to be the size of the LAST
+    // message only, with the rest relabelled as "cache_read" on the assumption
+    // that earlier turns were cached.  Nothing ever confirmed that cache hit, and
+    // when a turn ended on a large tool_result the reported prompt collapsed to
+    // (or exploded to) the size of that single block — that is the 11.1k -> 90k
+    // jump in Claude Code's context meter.  Report the measured prompt and leave
+    // the cache fields for usage that the provider itself reports.
+    let (initial_input_tokens, initial_cached_tokens) = (calculated_input_tokens.max(1), 0u64);
 
     let tools_summary: Vec<String> = req
         .tools
@@ -378,7 +373,16 @@ pub async fn messages_handler(
                         } else {
                             crate::protocol::tokens::TokenCalculator::count_text(&raw_text).max(1) as u64
                         };
-                        let turn_usage = crate::protocol::tokens::TokenUsage::new(calculated_input_tokens, out_tokens);
+                        // Prefer the provider's own input count, but reject a
+                        // cumulative session total replayed as a turn value.
+                        let in_tokens = if usage.input_tokens > 0
+                            && usage.input_tokens <= calculated_input_tokens.saturating_mul(4)
+                        {
+                            usage.input_tokens
+                        } else {
+                            calculated_input_tokens
+                        };
+                        let turn_usage = crate::protocol::tokens::TokenUsage::new(in_tokens, out_tokens);
                         state.token_tracker.record_turn(&session_key, &req.model, turn_usage).await;
 
                         let tools_decl = req.tools.clone().unwrap_or_default();
@@ -435,7 +439,7 @@ pub async fn messages_handler(
                             "model": req.model,
                             "content": content_blocks,
                             "stop_reason": stop_reason,
-                            "usage": {"input_tokens": calculated_input_tokens, "output_tokens": out_tokens}
+                            "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens}
                         }))
                         .into_response();
                     }
@@ -666,41 +670,46 @@ pub async fn messages_handler(
 
                 let total_prompt_tokens = calculated_input_tokens;
 
-                // Extract upstream reported usage or fallback to token calculations
-                let (raw_in, raw_out, raw_cached) = if let Some(u) = captured_usage {
-                    (u.input_tokens, u.output_tokens, u.cache_read_input_tokens)
-                } else {
+                // Token accounting policy:
+                //   1. If the provider (ACP result / OpenAI SSE) reported usage for
+                //      THIS turn, forward it verbatim — that is the only
+                //      ground-truth number available.
+                //   2. Otherwise report what we measured ourselves: the request
+                //      size for input and the rendered text for output.  Never
+                //      invent a cache split, and never clamp a plausible provider
+                //      number down to a guess.
+                // Always measure what the model actually rendered, even when the
+                // provider reported usage: some report `output_tokens: 0`, and
+                // recording a zero to the ledger (and to the SSE message_delta)
+                // is worse than a tokenizer estimate.
+                let measured_out = {
                     let text_tok = crate::protocol::tokens::TokenCalculator::count_text(&streamer.engine.text_buffer);
-                    let est_out = (text_tok + streamer.engine.emitted_tool_count * 15).max(1) as u64;
-                    (initial_input_tokens, est_out, initial_cached_tokens)
+                    (text_tok + streamer.engine.emitted_tool_count * 15).max(1) as u64
                 };
 
-                // Normalize input & cached tokens:
-                // Anthropic specification requires that input_tokens + cache_read_input_tokens
-                // accurately reflects THIS turn's prompt payload, NOT OpenCode's cumulative session database table.
-                let final_input;
-                let final_cached_read;
-
-                if raw_in + raw_cached > total_prompt_tokens.saturating_mul(13) / 10 {
-                    // OpenCode reported cumulative session tokens or an inflated count.
-                    // Bound by the actual turn payload size measured by TokenCalculator.
-                    if raw_in <= total_prompt_tokens && raw_in > 0 {
-                        final_input = raw_in.max(1);
-                        final_cached_read = raw_cached.min(total_prompt_tokens.saturating_sub(final_input));
-                    } else {
-                        // raw_in itself is cumulative session total! Fall back to turn-accurate calculation
-                        final_input = initial_input_tokens;
-                        final_cached_read = initial_cached_tokens;
+                let (final_input, final_cached_read) = match captured_usage {
+                    // A sane per-turn report can be larger than our own estimate
+                    // (different tokenizer, tool schemas we do not model), but a
+                    // figure an order of magnitude past the whole request is a
+                    // cumulative session total replayed as a turn value.  In that
+                    // case fall back to the measured prompt instead of lying.
+                    Some(u)
+                        if u.input_tokens.saturating_add(u.cache_read_input_tokens) > 0
+                            && u.input_tokens
+                                .saturating_add(u.cache_read_input_tokens)
+                                <= total_prompt_tokens.saturating_mul(4) =>
+                    {
+                        (u.input_tokens.max(1), u.cache_read_input_tokens)
                     }
-                } else if raw_in > 0 || raw_cached > 0 {
-                    final_input = raw_in.max(1);
-                    final_cached_read = raw_cached;
-                } else {
-                    final_input = initial_input_tokens;
-                    final_cached_read = initial_cached_tokens;
-                }
+                    _ => (initial_input_tokens, 0),
+                };
 
-                let final_output = raw_out.max(1);
+                let upstream_output = captured_usage.map(|u| u.output_tokens).unwrap_or(0);
+                let final_output = if upstream_output > 0 {
+                    upstream_output
+                } else {
+                    measured_out
+                };
 
                 let final_usage = crate::protocol::tokens::TokenUsage {
                     input_tokens: final_input,
