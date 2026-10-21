@@ -48,11 +48,27 @@ impl MessagesRequest {
 }
 
 pub fn is_compaction_text(text: &str) -> bool {
-    text.contains("Your summary should include the following sections:")
-        || (text.contains("Primary Request and Intent:") && text.contains("Key Technical Concepts:"))
-        || (text.contains("REMINDER: Do NOT call any tools") && text.contains("summary"))
-        || text.contains("Free up context by summarizing the conversation")
-        || text.contains("You are compacting the conversation")
+    let lower = text.to_ascii_lowercase();
+
+    // Explicit markers emitted by known Claude Code / OpenCode versions.
+    if lower.contains("your summary should include the following sections:")
+        || (lower.contains("primary request and intent:") && lower.contains("key technical concepts:"))
+        || (lower.contains("reminder: do not call any tools") && lower.contains("summary"))
+        || lower.contains("free up context by summarizing the conversation")
+        || lower.contains("you are compacting the conversation")
+    {
+        return true;
+    }
+
+    // Structural fallback for prompt revisions we have not seen yet: a long
+    // instruction asking for a compacted summary of the context. The length
+    // gate keeps ordinary "summarize this file" requests (which arrive with a
+    // tool catalog) from being mistaken for compaction.
+    let asks_to_summarize = lower.contains("summariz") || lower.contains("compact");
+    let summary_scope = lower.contains("conversation")
+        || lower.contains("context")
+        || lower.contains("transcript");
+    asks_to_summarize && summary_scope && text.len() >= 300
 }
 
 fn default_max_tokens() -> u32 {

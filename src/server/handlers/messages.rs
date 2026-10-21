@@ -1,5 +1,5 @@
 use crate::protocol::anthropic::{AnthropicContent, ContentBlock, MessagesRequest};
-use crate::protocol::prompt::build_acp_prompt;
+use crate::protocol::prompt::build_acp_prompt_with_budget;
 use crate::protocol::stream::{AcpStreamAdapter, AnthropicStreamEngine, OpenAiStreamAdapter};
 use crate::protocol::transform::transform_anthropic_to_openai;
 use crate::server::state::AppState;
@@ -332,7 +332,11 @@ pub async fn messages_handler(
         // 3. Local ACP Agent branch
         let agent_reg = crate::agents::AgentRegistry::default();
         if let Some(agent) = agent_reg.get(&target.provider) {
-            let prompt_text = build_acp_prompt(&req);
+            // Budget against the model that will actually serve the turn, not the
+            // Claude-facing alias: an alias may resolve to a much smaller context
+            // window (e.g. mimo at 64k) than the name suggests.
+            let context_limit = crate::protocol::prompt::model_context_limit(&target.model);
+            let prompt_text = build_acp_prompt_with_budget(&req, context_limit);
 
             if !req.stream {
                 let (prompt_tx, mut prompt_rx) =
