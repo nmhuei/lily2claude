@@ -1,4 +1,3 @@
-use crate::adapters::acp_client::AcpClient;
 use crate::adapters::http_upstream::HttpUpstreamAdapter;
 use crate::config::warp_pool::WarpPool;
 use crate::config::Config;
@@ -56,14 +55,12 @@ pub struct TargetCandidate {
 pub struct EngineRouter {
     config: Config,
     http_adapters: HashMap<String, Arc<HttpUpstreamAdapter>>,
-    acp_adapters: HashMap<String, Arc<AcpClient>>,
     health: ProviderHealthRegistry,
 }
 
 impl EngineRouter {
     pub fn new(config: Config) -> Self {
         let mut http_adapters = HashMap::new();
-        let mut acp_adapters = HashMap::new();
 
         for (name, p_cfg) in &config.providers {
             if p_cfg.kind == "opencode_free" || p_cfg.kind == "openai_http" {
@@ -88,17 +85,12 @@ impl EngineRouter {
                     name.clone(),
                     Arc::new(HttpUpstreamAdapter::new(&endpoint, token.as_deref(), pool)),
                 );
-            } else if p_cfg.kind == "acp_stdio" {
-                if let Some(cmd) = &p_cfg.command {
-                    acp_adapters.insert(name.clone(), Arc::new(AcpClient::new(cmd.clone())));
-                }
             }
         }
 
         Self {
             config,
             http_adapters,
-            acp_adapters,
             health: ProviderHealthRegistry::new(),
         }
     }
@@ -300,9 +292,5 @@ impl EngineRouter {
             .values()
             .filter_map(|adapter| adapter.warp_pool())
             .collect()
-    }
-
-    pub fn get_acp_adapter(&self, provider: &str) -> Option<Arc<AcpClient>> {
-        self.acp_adapters.get(provider).cloned()
     }
 }
