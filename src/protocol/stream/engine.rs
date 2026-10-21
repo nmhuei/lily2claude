@@ -383,11 +383,20 @@ impl AnthropicStreamEngine {
         }
         self.finished = true;
         self.state = EngineState::Finished;
+        let error_type = if crate::config::warp_pool::is_upstream_rate_limited(message)
+            || message.to_lowercase().contains("overload")
+            || message.to_lowercase().contains("capacity")
+            || message.contains("529")
+        {
+            "overloaded_error"
+        } else {
+            "api_error"
+        };
         events.push(SseEvent::new(
             "error",
             json!({
                 "type": "error",
-                "error": {"type": "upstream_error", "message": message}
+                "error": {"type": error_type, "message": message}
             }),
         ));
         events

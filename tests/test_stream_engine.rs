@@ -222,8 +222,21 @@ fn test_cancel_and_upstream_error_terminate() {
     let mut errored = AnthropicStreamEngine::new("msg_error", "deepseek", 10, HashMap::new());
     let _ = errored.feed_text("partial");
     let events = errored.feed_error("boom");
-    assert!(events.iter().any(|e| e.event == "error"));
+    let err_ev = events.iter().find(|e| e.event == "error").expect("error event present");
+    assert_eq!(err_ev.data["error"]["type"], "api_error");
+    assert_eq!(err_ev.data["error"]["message"], "boom");
     assert!(errored.feed_text("ignored").is_empty());
+
+    // Rate-limited / quota errors must emit "overloaded_error" so Claude Code retries
+    let mut quota_errored = AnthropicStreamEngine::new("msg_quota", "deepseek", 10, HashMap::new());
+    let q_events = quota_errored.feed_error("Internal error: Free usage limit reached. provider.free-limit");
+    let q_err = q_events.iter().find(|e| e.event == "error").expect("error event present");
+    assert_eq!(q_err.data["error"]["type"], "overloaded_error");
+
+    let mut rate_errored = AnthropicStreamEngine::new("msg_rate", "deepseek", 10, HashMap::new());
+    let r_events = rate_errored.feed_error("upstream 429 Too Many Requests");
+    let r_err = r_events.iter().find(|e| e.event == "error").expect("error event present");
+    assert_eq!(r_err.data["error"]["type"], "overloaded_error");
 }
 
 #[test]
