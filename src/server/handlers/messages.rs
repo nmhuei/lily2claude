@@ -661,6 +661,28 @@ pub async fn messages_handler(
                     }
                 }
 
+                // If turn completed without errors but emitted 0 tools AND 0 visible text (and not compaction),
+                // the upstream agent produced an empty turn (e.g. abrupt EOF or dropped stream).
+                // Do NOT emit an empty assistant message with end_turn — that causes Claude Code to inject
+                // "[Your previous response had no visible output]" and eventually fail subagents!
+                if streamer.engine.emitted_tool_count == 0
+                    && streamer.engine.accumulated_text().trim().is_empty()
+                    && streamer.engine.text_buffer.trim().is_empty()
+                    && !is_compact
+                {
+                    if is_debug {
+                        eprintln!(">>> EXECUTE_TURN completed with 0 tools and 0 text. Emitting SSE error so client retries cleanly.");
+                    }
+                    session_mgr_stream.evict_session(&s_key_clone, &provider_name).await;
+                    let err_events = streamer.engine.feed_error("Upstream agent returned empty response without text or tools");
+                    for ev in err_events {
+                        let _ = sse_tx
+                            .send(Ok(Event::default().event(ev.event).data(ev.data.to_string())))
+                            .await;
+                    }
+                    return;
+                }
+
                 let total_prompt_tokens = calculated_input_tokens;
 
                 // Token accounting policy:

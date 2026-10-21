@@ -69,7 +69,7 @@ impl SessionManager {
         {
             let mut lock = self.sessions.lock().await;
             let mut dead_keys = Vec::new();
-            for worker_idx in 0..4 {
+            for worker_idx in 0..16 {
                 let full_key = if worker_idx == 0 {
                     base_key.clone()
                 } else {
@@ -126,7 +126,7 @@ impl SessionManager {
 
         // 3. Insert into sessions map with lock
         let mut lock = self.sessions.lock().await;
-        for worker_idx in 0..4 {
+        for worker_idx in 0..16 {
             let full_key = if worker_idx == 0 {
                 base_key.clone()
             } else {
@@ -137,7 +137,29 @@ impl SessionManager {
                 return Ok(handle);
             }
         }
-        lock.insert(base_key, (child_pid, handle.clone()));
+        // If all 16 slots are occupied, replace a terminated worker or append with dynamic index instead of overwriting active slot 0
+        let mut dead_slot = None;
+        for worker_idx in 0..16 {
+            let full_key = if worker_idx == 0 {
+                base_key.clone()
+            } else {
+                format!("{}:worker_{}", base_key, worker_idx)
+            };
+            if let Some((_, sess)) = lock.get(&full_key) {
+                if let Ok(mut s) = sess.try_lock() {
+                    if s.child.try_wait().ok().flatten().is_some() {
+                        dead_slot = Some(full_key);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(k) = dead_slot {
+            lock.insert(k, (child_pid, handle.clone()));
+        } else {
+            let dynamic_key = format!("{}:worker_{}", base_key, lock.len());
+            lock.insert(dynamic_key, (child_pid, handle.clone()));
+        }
         Ok(handle)
     }
 
@@ -181,7 +203,7 @@ impl SessionManager {
             let mut sessions_to_kill = Vec::new();
 
             for (k, (pid, sess)) in lock.iter() {
-                if k == &base_prefix || k.starts_with(&format!("{}:", base_prefix)) {
+                if k == &base_prefix || k.starts_with(&format!("{}:worker_", base_prefix)) {
                     to_remove_keys.push(k.clone());
                     sessions_to_kill.push((*pid, sess.clone()));
                 }

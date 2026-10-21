@@ -50,3 +50,40 @@ async fn test_session_manager_initialization() {
     let mgr = SessionManager::new();
     assert_eq!(mgr.active_count().await, 0);
 }
+
+#[test]
+fn test_subagent_headers_isolate_session_keys() {
+    use axum::http::HeaderMap;
+    use lily2claude::engine::session::extract_session_key_from_headers_or_req;
+
+    let req = MessagesRequest {
+        model: "deepseek".to_string(),
+        messages: vec![],
+        system: None,
+        tools: None,
+        stream: false,
+        max_tokens: 100,
+        temperature: None,
+    };
+
+    let mut main_headers = HeaderMap::new();
+    main_headers.insert("x-claude-code-session-id", "root-session-123".parse().unwrap());
+
+    let mut subagent1_headers = HeaderMap::new();
+    subagent1_headers.insert("x-claude-code-session-id", "root-session-123".parse().unwrap());
+    subagent1_headers.insert("x-claude-code-agent-id", "subagent-audit-protocol".parse().unwrap());
+
+    let mut subagent2_headers = HeaderMap::new();
+    subagent2_headers.insert("x-claude-code-session-id", "root-session-123".parse().unwrap());
+    subagent2_headers.insert("x-claude-code-agent-id", "subagent-audit-implementation".parse().unwrap());
+
+    let main_key = extract_session_key_from_headers_or_req(&main_headers, &req);
+    let sub1_key = extract_session_key_from_headers_or_req(&subagent1_headers, &req);
+    let sub2_key = extract_session_key_from_headers_or_req(&subagent2_headers, &req);
+
+    assert_eq!(main_key, "root-session-123");
+    assert_eq!(sub1_key, "root-session-123:agent:subagent-audit-protocol");
+    assert_eq!(sub2_key, "root-session-123:agent:subagent-audit-implementation");
+    assert_ne!(main_key, sub1_key);
+    assert_ne!(sub1_key, sub2_key);
+}

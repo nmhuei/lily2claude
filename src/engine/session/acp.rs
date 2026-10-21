@@ -584,6 +584,20 @@ impl AcpSession {
                     }
                 }
 
+                // Capture error notifications from session updates (e.g. provider limits, agent errors)
+                if let Some(err) = v.pointer("/params/update/error").or_else(|| v.pointer("/params/error")) {
+                    if is_debug {
+                        eprintln!(">>> ACP notification error: {:?}", err);
+                    }
+                    prompt_err = Some(err.clone());
+                } else if update_type == Some("error") {
+                    let err = v.pointer("/params/update").unwrap_or(&v).clone();
+                    if is_debug {
+                        eprintln!(">>> ACP update_type=error: {:?}", err);
+                    }
+                    prompt_err = Some(err);
+                }
+
                 // Check stop conditions
                 let is_matching_result = v.get("id").and_then(|id| id.as_u64()) == Some(prompt_call_id);
                 let is_stop_notification = v.pointer("/params/update/stopReason").is_some()

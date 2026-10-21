@@ -29,26 +29,42 @@ pub fn extract_session_key_from_headers_or_req(
     req: &MessagesRequest,
 ) -> String {
     // 1. Claude Code native session header
-    if let Some(val) = headers.get("x-claude-code-session-id").and_then(|v| v.to_str().ok()) {
+    let base = if let Some(val) = headers.get("x-claude-code-session-id").and_then(|v| v.to_str().ok()) {
         let trimmed = val.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            Some(trimmed.to_string())
+        } else {
+            None
         }
-    }
-    // 2. Custom lily session header
-    if let Some(val) = headers.get("x-lily-session").and_then(|v| v.to_str().ok()) {
+    } else if let Some(val) = headers.get("x-lily-session").and_then(|v| v.to_str().ok()) {
         let trimmed = val.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            Some(trimmed.to_string())
+        } else {
+            None
         }
-    }
-    // 3. Generic session header
-    if let Some(val) = headers.get("x-session-id").and_then(|v| v.to_str().ok()) {
+    } else if let Some(val) = headers.get("x-session-id").and_then(|v| v.to_str().ok()) {
         let trimmed = val.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            Some(trimmed.to_string())
+        } else {
+            None
         }
+    } else {
+        None
+    }.unwrap_or_else(|| extract_session_key(req));
+
+    // Isolate subagents: if Claude Code passes an agent ID, namespace the session key
+    // so parallel subagents don't fight over the same worker slots or kill each other on eviction!
+    if let Some(agent_id) = headers
+        .get("x-claude-code-agent-id")
+        .or_else(|| headers.get("x-agent-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        format!("{}:agent:{}", base, agent_id)
+    } else {
+        base
     }
-    // 4. Fallback to conversation root message hash
-    extract_session_key(req)
 }
