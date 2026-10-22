@@ -99,11 +99,7 @@ impl Agent for CommandCodeAgent {
     }
 
     fn default_aliases(&self) -> Vec<(&'static str, String)> {
-        vec![
-            ("deepseek", "commandcode:deepseek/deepseek-v4.1-flash".to_string()),
-            ("glm", "commandcode:z-ai/glm-5.3-flash".to_string()),
-            ("mimo", "commandcode:xiaomi/mimo-v2.6-flash".to_string()),
-        ]
+        vec![]
     }
 
     async fn execute_turn(

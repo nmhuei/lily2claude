@@ -139,12 +139,18 @@ fn default_target_fallback() -> String {
     "deepseek".to_string()
 }
 
+fn default_disable_commandcode() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server_port: u16,
     pub server_host: String,
     #[serde(default = "default_target_fallback")]
     pub default_target: String,
+    #[serde(default = "default_disable_commandcode")]
+    pub disable_commandcode: bool,
     #[serde(default)]
     pub launcher: LauncherConfig,
     #[serde(default)]
@@ -194,7 +200,6 @@ impl Config {
 
         let deepseek_targets = vec![
             "opencode:deepseek-v4.1-flash-free".to_string(),
-            "commandcode:deepseek/deepseek-v4.1-flash".to_string(),
         ];
 
         // Ensure transparent aliases have full fallbacks
@@ -230,7 +235,6 @@ impl Config {
 
         aliases.entry("glm".to_string()).or_insert_with(|| vec![
             "opencode:glm-5.3-flash-free".to_string(),
-            "commandcode:z-ai/glm-5.3-flash".to_string(),
         ]);
         aliases.entry("kilo".to_string()).or_insert_with(|| vec![
             "kilo:kilo-auto/free".to_string(),
@@ -240,12 +244,10 @@ impl Config {
         ]);
         aliases.entry("mimo".to_string()).or_insert_with(|| vec![
             "opencode:mimo-v2.6-flash-free".to_string(),
-            "commandcode:xiaomi/mimo-v2.6-flash".to_string(),
         ]);
         aliases.entry("nemotron".to_string()).or_insert_with(|| vec![
             "opencode:nemotron-3.5-lightning-free".to_string(),
             "opencode:nemotron-3-ultra-free".to_string(),
-            "commandcode:nvidia/nemotron-3-ultra-550b-a55b".to_string(),
         ]);
         aliases.entry("qwen".to_string()).or_insert_with(|| vec![
             "opencode:qwen3.6-plus-free".to_string(),
@@ -327,6 +329,7 @@ impl Config {
             server_port: 4001,
             server_host: "127.0.0.1".to_string(),
             default_target: "deepseek".to_string(),
+            disable_commandcode: true,
             launcher: LauncherConfig::default(),
             warp: WarpConfig::default(),
             aliases,

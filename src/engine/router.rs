@@ -119,6 +119,9 @@ impl EngineRouter {
             if t.contains(':') {
                 let parts: Vec<&str> = t.splitn(2, ':').collect();
                 if parts.len() == 2 {
+                    if self.config.disable_commandcode && parts[0] == "commandcode" {
+                        continue;
+                    }
                     candidates.push(TargetCandidate {
                         provider: parts[0].to_string(),
                         model: parts[1].to_string(),
@@ -133,7 +136,14 @@ impl EngineRouter {
 
     pub fn resolve_alias(&self, alias: &str) -> Vec<TargetCandidate> {
         let raw = self.resolve_alias_raw(alias);
-        self.health.prioritize_candidates(raw)
+        let filtered: Vec<TargetCandidate> = if self.config.disable_commandcode {
+            raw.into_iter()
+                .filter(|c| c.provider != "commandcode")
+                .collect()
+        } else {
+            raw
+        };
+        self.health.prioritize_candidates(filtered)
     }
 
     pub fn resolve_alias_raw(&self, alias: &str) -> Vec<TargetCandidate> {
@@ -270,14 +280,16 @@ impl EngineRouter {
         if alias.contains(':') {
             let parts: Vec<&str> = alias.splitn(2, ':').collect();
             if parts.len() == 2 {
-                let mut res = vec![TargetCandidate {
-                    provider: parts[0].to_string(),
-                    model: parts[1].to_string(),
-                }];
-                if let Some(ds) = self.config.aliases.get("deepseek") {
-                    res.extend(self.resolve_targets(ds, 0));
+                if !self.config.disable_commandcode || parts[0] != "commandcode" {
+                    let mut res = vec![TargetCandidate {
+                        provider: parts[0].to_string(),
+                        model: parts[1].to_string(),
+                    }];
+                    if let Some(ds) = self.config.aliases.get("deepseek") {
+                        res.extend(self.resolve_targets(ds, 0));
+                    }
+                    return res;
                 }
-                return res;
             }
         }
 

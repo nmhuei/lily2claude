@@ -3,7 +3,15 @@ use lily2claude::engine::router::EngineRouter;
 
 #[test]
 fn test_router_prioritizes_opencode_over_acp_for_deepseek() {
-    let config = Config::load_default();
+    let mut config = Config::load_default();
+    config.disable_commandcode = false;
+    config.aliases.insert(
+        "deepseek".to_string(),
+        vec![
+            "opencode:deepseek-v4.1-flash-free".to_string(),
+            "commandcode:deepseek/deepseek-v4.1-flash".to_string(),
+        ],
+    );
     let router = EngineRouter::new(config);
 
     let candidates = router.resolve_alias("deepseek");
@@ -36,7 +44,15 @@ fn test_router_resolves_claude_subagent_models_to_deepseek() {
 
 #[test]
 fn test_circuit_breaker_prioritizes_healthy_candidates() {
-    let config = Config::load_default();
+    let mut config = Config::load_default();
+    config.disable_commandcode = false;
+    config.aliases.insert(
+        "deepseek".to_string(),
+        vec![
+            "opencode:deepseek-v4.1-flash-free".to_string(),
+            "commandcode:deepseek/deepseek-v4.1-flash".to_string(),
+        ],
+    );
     let router = EngineRouter::new(config);
 
     // Initial state: opencode is primary
@@ -50,4 +66,29 @@ fn test_circuit_breaker_prioritizes_healthy_candidates() {
     let c2 = router.resolve_alias("deepseek");
     assert_eq!(c2[0].provider, "commandcode");
     assert_eq!(c2.last().unwrap().provider, "opencode");
+}
+
+#[test]
+fn test_router_commandcode_is_frozen_by_default() {
+    let config = Config::load_default();
+    let router = EngineRouter::new(config);
+
+    let candidates = router.resolve_alias("deepseek");
+    assert!(!candidates.is_empty());
+    assert_eq!(candidates[0].provider, "opencode");
+    assert!(candidates.iter().all(|c| c.provider != "commandcode"));
+
+    let glm_candidates = router.resolve_alias("glm");
+    assert!(!glm_candidates.is_empty());
+    assert_eq!(glm_candidates[0].provider, "opencode");
+    assert!(glm_candidates.iter().all(|c| c.provider != "commandcode"));
+
+    let mimo_candidates = router.resolve_alias("mimo");
+    assert!(!mimo_candidates.is_empty());
+    assert_eq!(mimo_candidates[0].provider, "opencode");
+    assert!(mimo_candidates.iter().all(|c| c.provider != "commandcode"));
+
+    let nemotron_candidates = router.resolve_alias("nemotron");
+    assert!(!nemotron_candidates.is_empty());
+    assert!(nemotron_candidates.iter().all(|c| c.provider != "commandcode"));
 }
