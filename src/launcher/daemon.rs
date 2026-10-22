@@ -182,8 +182,11 @@ pub fn stop_daemon(port: u16, verbose: bool) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         if let Some(p) = pid {
-            unsafe {
-                let _ = libc::kill(p as i32, libc::SIGKILL);
+            if p > 1 {
+                unsafe {
+                    let _ = libc::kill(-(p as i32), libc::SIGKILL);
+                    let _ = libc::kill(p as i32, libc::SIGKILL);
+                }
             }
         }
     }

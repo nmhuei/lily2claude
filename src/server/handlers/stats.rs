@@ -9,8 +9,9 @@ pub async fn stats_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 pub async fn reset_usage_handler(State(state): State<AppState>) -> impl IntoResponse {
     state.token_tracker.reset().await;
+    state.session_mgr.sweep_idle(std::time::Duration::from_secs(0)).await;
     Json(json!({
         "status": "ok",
-        "message": "Token usage ledger and session history successfully reset to 0"
+        "message": "Token usage ledger, session history, and cached workers successfully cleared"
     }))
 }

@@ -6,6 +6,21 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+struct ProcessGroupGuard(Option<u32>);
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0 {
+            if pid > 1 {
+                unsafe {
+                    let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
 pub struct AcpClient {
     command: Vec<String>,
 }
@@ -32,6 +47,9 @@ impl AcpClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         // Same data directory as `AcpSession::spawn`: both spawn opencode, and
         // two different XDG_DATA_HOME values would have them corrupting each
@@ -72,6 +90,7 @@ impl AcpClient {
         }
 
         let mut child = cmd.spawn()?;
+        let _group_guard = ProcessGroupGuard(child.id());
 
         let mut stdin = child.stdin.take().expect("Failed to open stdin");
         let stdout = child.stdout.take().expect("Failed to open stdout");

@@ -26,7 +26,34 @@ async fn main() -> anyhow::Result<()> {
             let addr = format!("{}:{}", host, port);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             println!("⚡ lily2claude server listening on http://{}", addr);
-            axum::serve(listener, app).await?;
+
+            let shutdown_signal = async {
+                let ctrl_c = async {
+                    tokio::signal::ctrl_c()
+                        .await
+                        .expect("failed to install Ctrl+C handler");
+                };
+
+                #[cfg(unix)]
+                let terminate = async {
+                    if let Ok(mut stream) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                        stream.recv().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+
+                #[cfg(not(unix))]
+                let terminate = std::future::pending::<()>();
+
+                tokio::select! {
+                    _ = ctrl_c => {},
+                    _ = terminate => {},
+                }
+            };
+
+            axum::serve(listener, app).with_graceful_shutdown(shutdown_signal).await?;
+            lily2claude::launcher::daemon::remove_pid_file(port);
         }
         Some(Commands::Server { action, port }) => {
             match action {

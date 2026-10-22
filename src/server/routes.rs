@@ -27,12 +27,17 @@ pub fn create_router(router: Arc<EngineRouter>) -> Router {
         }
     }
 
-    // Background idle cleanup: evicts sessions inactive for > 5 minutes
+    // Background idle cleanup: evicts sessions inactive for > 2 minutes (default) or L2C_IDLE_TIMEOUT_SECS
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let idle_timeout = std::env::var("L2C_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(std::time::Duration::from_secs(120));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
-            session_mgr.sweep_idle(std::time::Duration::from_secs(300)).await;
+            session_mgr.sweep_idle(idle_timeout).await;
         }
     });
 

@@ -36,6 +36,9 @@ impl AcpSession {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
+        #[cfg(unix)]
+        cmd.process_group(0);
+
         let mut proxy_used = None;
 
         // opencode keeps a SQLite database under XDG_DATA_HOME, so point it at
@@ -662,5 +665,19 @@ impl AcpSession {
             pool.report_success(proxy);
         }
         Ok(final_usage)
+    }
+}
+
+impl Drop for AcpSession {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.child_pid {
+            if pid > 1 {
+                unsafe {
+                    let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+        }
+        let _ = self.child.start_kill();
     }
 }

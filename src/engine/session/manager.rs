@@ -190,6 +190,12 @@ impl SessionManager {
                 let _ = s.child.wait().await;
             }
             if let Some(p) = pid {
+                #[cfg(unix)]
+                if p > 1 {
+                    unsafe {
+                        let _ = libc::kill(-(p as i32), libc::SIGKILL);
+                    }
+                }
                 let _ = tokio::process::Command::new("kill").args(["-9", &p.to_string()]).output().await;
             }
         }
@@ -221,6 +227,12 @@ impl SessionManager {
                 let _ = s.child.wait().await;
             }
             if let Some(p) = pid {
+                #[cfg(unix)]
+                if p > 1 {
+                    unsafe {
+                        let _ = libc::kill(-(p as i32), libc::SIGKILL);
+                    }
+                }
                 let _ = tokio::process::Command::new("kill").args(["-9", &p.to_string()]).output().await;
             }
         }

@@ -51,6 +51,13 @@ async fn test_session_manager_initialization() {
     assert_eq!(mgr.active_count().await, 0);
 }
 
+#[tokio::test]
+async fn test_session_manager_sweep_idle() {
+    let mgr = SessionManager::new();
+    mgr.sweep_idle(std::time::Duration::from_secs(0)).await;
+    assert_eq!(mgr.active_count().await, 0);
+}
+
 #[test]
 fn test_subagent_headers_isolate_session_keys() {
     use axum::http::HeaderMap;
