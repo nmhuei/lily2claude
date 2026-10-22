@@ -46,7 +46,7 @@ pub const ALIAS_MODELS: &[AliasModel] = &[
         behaves_as: "claude-sonnet-4-5",
         context_length: 200_000,
         max_output_tokens: 32_000,
-        auto_compact_window: 160_000,
+        auto_compact_window: 190_000,
         effort_level: Some("high"),
     },
     AliasModel {
@@ -57,7 +57,7 @@ pub const ALIAS_MODELS: &[AliasModel] = &[
         behaves_as: "claude-sonnet-4-5",
         context_length: 200_000,
         max_output_tokens: 32_000,
-        auto_compact_window: 160_000,
+        auto_compact_window: 190_000,
         effort_level: Some("high"),
     },
     AliasModel {
@@ -68,7 +68,7 @@ pub const ALIAS_MODELS: &[AliasModel] = &[
         behaves_as: "claude-haiku-4-5",
         context_length: 200_000,
         max_output_tokens: 32_000,
-        auto_compact_window: 160_000,
+        auto_compact_window: 190_000,
         effort_level: None,
     },
     AliasModel {
@@ -112,7 +112,7 @@ pub const ALIAS_MODELS: &[AliasModel] = &[
         behaves_as: "claude-sonnet-4-5",
         context_length: 200_000,
         max_output_tokens: 32_000,
-        auto_compact_window: 160_000,
+        auto_compact_window: 190_000,
         effort_level: None,
     },
     AliasModel {

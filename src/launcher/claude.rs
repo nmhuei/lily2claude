@@ -38,6 +38,12 @@ pub fn build_settings_json(model: &str, port: u16, context_tokens: u32) -> Strin
         })
         .collect();
 
+    let (compact_window, compact_pct) = if context_tokens == 200_000 {
+        (context_tokens.saturating_mul(95) / 100, "95")
+    } else {
+        (context_tokens.saturating_mul(8) / 10, "80")
+    };
+
     json!({
         "env": {
             "ANTHROPIC_BASE_URL": format!("http://127.0.0.1:{}", port),
@@ -59,8 +65,8 @@ pub fn build_settings_json(model: &str, port: u16, context_tokens: u32) -> Strin
             "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1",
             "CLAUDE_CODE_DISABLE_MODEL_ACCESS_FALLBACK": "1",
             "CLAUDE_CODE_MAX_CONTEXT_TOKENS": context_tokens.to_string(),
-            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": (context_tokens.saturating_mul(8) / 10).to_string(),
-            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "80",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": compact_window.to_string(),
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": compact_pct,
             "API_TIMEOUT_MS": "600000",
             "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS": "600000",
             "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "600000",
@@ -75,7 +81,7 @@ pub fn build_settings_json(model: &str, port: u16, context_tokens: u32) -> Strin
         "disableWorkflows": false,
         "skipWorkflowUsageWarning": true,
         "autoCompactEnabled": true,
-        "autoCompactWindow": context_tokens.saturating_mul(8) / 10,
+        "autoCompactWindow": compact_window,
         "modelSettings": model_settings
     })
     .to_string()
@@ -105,6 +111,12 @@ pub fn launch_claude(model: &str, port: u16, extra_args: &[String]) -> anyhow::R
 
     println!("⚡ lily2claude: Launching Claude Code with model '{}' (context limit: {} tokens)...", model, ctx);
 
+    let (compact_window, compact_pct) = if ctx == 200_000 {
+        (ctx.saturating_mul(95) / 100, "95")
+    } else {
+        (ctx.saturating_mul(8) / 10, "80")
+    };
+
     let mut cmd = Command::new("claude");
     cmd.env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{}", port));
     cmd.env("ANTHROPIC_API_KEY", "dummy");
@@ -126,8 +138,8 @@ pub fn launch_claude(model: &str, port: u16, extra_args: &[String]) -> anyhow::R
     cmd.env("CLAUDE_CODE_DISABLE_MODEL_ACCESS_FALLBACK", "1");
     cmd.env("CLAUDE_CODE_NO_MODEL_FALLBACK", "1");
     cmd.env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", ctx.to_string());
-    cmd.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", (ctx.saturating_mul(8) / 10).to_string());
-    cmd.env("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "80");
+    cmd.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", compact_window.to_string());
+    cmd.env("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", compact_pct);
     cmd.env("API_TIMEOUT_MS", "600000");
     cmd.env("CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS", "600000");
     cmd.env("CLAUDE_STREAM_IDLE_TIMEOUT_MS", "600000");
